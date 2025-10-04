@@ -964,6 +964,29 @@ if __name__ == "__main__":
     print("✅ Bot started")
     while True:
         try:
+            if __name__ == "__main__":
+    # Снять вебхук на всякий случай, чтобы polling не конфликтовал
+    try:
+        bot.remove_webhook(drop_pending_updates=True)
+        print("Webhook removed")
+    except Exception as e:
+        print("remove_webhook warning:", e)
+
+    for aid in ADMIN_IDS:
+        admin_auto_premium(aid)
+
+    threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=auto_restart, daemon=True).start()
+
+    print("✅ Bot started")
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=90, long_polling_timeout=30)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            log.error("polling error: %s", e)
+            time.sleep(3)
             bot.infinity_polling(skip_pending=True, timeout=90, long_polling_timeout=30)
         except KeyboardInterrupt:
             break
