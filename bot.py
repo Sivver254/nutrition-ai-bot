@@ -963,8 +963,8 @@ if __name__ == "__main__":
 
     print("✅ Bot started")
     while True:
-        try:
-            if __name__ == "__main__":
+    try:
+        if __name__ == "__main__":
     # Снять вебхук на всякий случай, чтобы polling не конфликтовал
     try:
         bot.remove_webhook(drop_pending_updates=True)
