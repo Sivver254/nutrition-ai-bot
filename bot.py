@@ -1,4 +1,5 @@
-# bot.py (Часть 1/4) — конфиг, БД, триал, AI-утилиты
+# bot.py — Nutrition AI Bot (полная версия)
+
 import os, json, time, datetime, threading, re
 import telebot
 from telebot.types import (
@@ -6,16 +7,16 @@ from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
 )
 
-# ==== КОНФИГ ====
+# ========= КОНФИГ =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is not set (Render → Settings → Environment)")
 
-STAR_PRICE_PREMIUM_DEFAULT = int(os.getenv("STAR_PRICE_PREMIUM", "100"))  # цена в звёздах по умолч.
-PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))                       # срок премиума
-TRIAL_HOURS = 24                                                          # бесплатный доступ к КБЖУ (24ч)
+STAR_PRICE_PREMIUM_DEFAULT = int(os.getenv("STAR_PRICE_PREMIUM", "100"))
+PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
+TRIAL_HOURS = 24  # бесплатный доступ к КБЖУ (24 часа с момента первого использования)
 
-# админ (видит админку)
+# Админы
 def _parse_admins():
     ids = set()
     if os.getenv("ADMIN_ID"):
@@ -26,12 +27,12 @@ def _parse_admins():
             x = x.strip()
             if x.isdigit(): ids.add(int(x))
     if not ids:
-        ids.add(123456789)  # заменишь на свой ID или задай ADMIN_ID
+        ids.add(123456789)  # подставь свой ID или задай ADMIN_ID
     return ids
 ADMIN_IDS = _parse_admins()
 def is_admin(uid:int)->bool: return uid in ADMIN_IDS
 
-# OpenAI (опционально; для парсинга списков/рецептов/меню)
+# OpenAI (опционально)
 try:
     from openai import OpenAI
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -41,7 +42,7 @@ except Exception:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ==== "БД" (файл) ====
+# ========= ХРАНИЛКА (файл) =========
 DATA_FILE = "users.json"
 
 def _load():
@@ -100,7 +101,7 @@ def get_current_price() -> int:
     try: return int(os.getenv("STAR_PRICE_PREMIUM", str(STAR_PRICE_PREMIUM_DEFAULT)))
     except: return STAR_PRICE_PREMIUM_DEFAULT
 
-# ==== ТРИАЛ 24ч для КБЖУ ====
+# ========= ТРИАЛ =========
 def trial_status(uid:int):
     db = _load(); u = get_user(db, uid)
     ts = u.get("trial_started_at", 0)
@@ -120,7 +121,7 @@ def ensure_trial_or_premium(uid:int):
         return ("trial_started", u["trial_started_at"] + TRIAL_HOURS*3600)
     return ("denied", None)
 
-# ==== "Нейросеть" для КБЖУ ====
+# ========= Небольшая нутри-база + «ИИ» парсер =========
 NUTRI_BASE = {
     "куриная грудка": {"kcal":165,"p":31,"f":3.6,"c":0},
     "рис":            {"kcal":340,"p":7,"f":1,"c":76},
@@ -135,7 +136,6 @@ def norm_name(s:str)->str: return re.sub(r"\s+"," ",s.strip().lower())
 
 def llm_parse_foods(text:str):
     """вернёт [{"name":"овсянка","grams":60}, ...]"""
-    # без ключа — простой регекс
     if not oa_client:
         items = []
         for p in re.split(r"[;,\n]+", text):
@@ -187,47 +187,54 @@ def estimate_kbju(items):
         total["kcal"]+=kcal; total["p"]+=p; total["f"]+=f; total["c"]+=c
         details.append((n, int(g), round(kcal), round(p,1), round(f,1), round(c,1)))
     return round(total["kcal"]), round(total["p"],1), round(total["f"],1), round(total["c"],1), details
-    # bot.py (Часть 2/4) — меню и покупка премиума (Stars)
 
-# ==== ГЛАВНОЕ МЕНЮ ====
+# ========= Состояния диалога =========
+USER_FLOW = {}  # uid -> {"step": "...", "data": {...}}
+
+def reset_flow(uid: int):
+    """Полностью очищает состояние пользователя (антизалипание)."""
+    if uid in USER_FLOW:
+        USER_FLOW.pop(uid, None)
+        # ========= Меню =========
 def main_menu(user_id:int=None):
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(KeyboardButton("📸 КБЖУ по фото"), KeyboardButton("🧾 КБЖУ по списку"))
     kb.row(KeyboardButton("👩‍🍳 Рецепты от ИИ"), KeyboardButton("ℹ️ Помощь"))
     kb.row(KeyboardButton("⭐ Купить премиум"), KeyboardButton("📊 Проверить премиум"))
-    kb.row(KeyboardButton("📅 Меню на неделю"))  # без слова «премиум»
+    kb.row(KeyboardButton("📅 Меню на неделю"))
     if user_id and is_admin(user_id): kb.row(KeyboardButton("👨‍💻 Админка"))
     return kb
 
-# простые состояния диалогов
-USER_FLOW = {}  # uid -> { "step": ..., "data": {...} }
-
-# ==== START / HELP ====
+# ========= Старт / Помощь =========
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
+    reset_flow(m.from_user.id)
     db = _load(); get_user(db, m.from_user.id); _save(db)
     text = (
         "Привет! 🤖 Я помогу посчитать КБЖУ еды:\n"
         "• «📸 КБЖУ по фото» — пришли фото блюда\n"
         "• «🧾 КБЖУ по списку» — просто напиши продукты и граммы\n\n"
         "Также могу подобрать <b>меню на 7 дней</b> под твои параметры — «📅 Меню на неделю».\n"
-        "Рецепты от ИИ — бесплатно, премиум открывает доп. функции на 30 дней."
+        "«👩‍🍳 Рецепты от ИИ» — бесплатно. Премиум открывает доп. функции на 30 дней."
     )
     bot.send_message(m.chat.id, text, reply_markup=main_menu(m.from_user.id))
 
 @bot.message_handler(func=lambda m: m.text == "ℹ️ Помощь")
 def on_help(m):
+    reset_flow(m.from_user.id)
     bot.reply_to(m,
         "Как пользоваться:\n"
         "• «📸 КБЖУ по фото» — отправь фото (триал 24ч, затем премиум)\n"
         "• «🧾 КБЖУ по списку» — пример: «Овсянка 60 г; Молоко 200 мл; Банан 120 г» (триал 24ч)\n"
         "• «👩‍🍳 Рецепты от ИИ» — бесплатные рецепты по названию или на заданные калории\n"
-        "• «📅 Меню на неделю» — заполни анкету (вес/рост/цель), при отсутствии премиума предложу оплату XTR"
+        "• «📅 Меню на неделю» — заполни анкету, если нет премиума — предложу оплату XTR",
+        reply_markup=main_menu(m.from_user.id)
     )
 
-# ==== КУПИТЬ/ПРОВЕРИТЬ ПРЕМИУМ ====
+# ========= Премиум =========
 @bot.message_handler(func=lambda m: m.text == "📊 Проверить премиум")
 def check_premium(m):
+    reset_flow(m.from_user.id)
     if has_premium(m.from_user.id):
         db = _load(); u = db.get(str(m.from_user.id), {})
         exp = datetime.datetime.fromtimestamp(u.get("premium_until",0)).strftime("%d.%m.%Y")
@@ -237,6 +244,7 @@ def check_premium(m):
 
 @bot.message_handler(func=lambda m: m.text == "⭐ Купить премиум")
 def buy_premium(m):
+    reset_flow(m.from_user.id)
     price = get_current_price()
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton(f"Оплатить {price} ⭐", callback_data="buy_premium_stars"))
     bot.send_message(m.chat.id, f"Премиум на {PREMIUM_DAYS} дней открывает все функции.\nЦена: {price} ⭐", reply_markup=kb)
@@ -244,13 +252,13 @@ def buy_premium(m):
 @bot.callback_query_handler(func=lambda c: c.data == "buy_premium_stars")
 def cb_buy_premium_stars(c):
     price_now = get_current_price()
-    prices = [LabeledPrice(label="Премиум на 30 дней", amount=price_now)]  # XTR: amount=звёзды
+    prices = [LabeledPrice(label="Премиум на 30 дней", amount=price_now)]  # XTR
     bot.send_invoice(
         chat_id=c.message.chat.id,
         title="Премиум-доступ",
         description=f"Доступ ко всем функциям на {PREMIUM_DAYS} дней.",
         invoice_payload=f"premium_stars:{c.from_user.id}",
-        provider_token="",      # Stars токен не нужен
+        provider_token="",      # Stars не требует токена
         currency="XTR",
         prices=prices,
         is_flexible=False
@@ -272,7 +280,6 @@ def on_paid(m):
             set_premium(m.from_user.id, PREMIUM_DAYS)
             if total: log_payment(m.from_user.id, total, payload)
 
-            # если анкета для меню уже заполнена — сразу сгенерируем
             db = _load(); u = get_user(db, m.from_user.id)
             pending = u.get("pending_menu")
             if pending:
@@ -289,11 +296,108 @@ def on_paid(m):
             bot.send_message(m.chat.id, "✅ Оплата получена.", reply_markup=main_menu(m.from_user.id))
     except Exception as e:
         bot.send_message(m.chat.id, f"⚠️ Ошибка обработки платежа: {e}", reply_markup=main_menu(m.from_user.id))
-        # bot.py (Часть 3/4) — функционал фич
 
-# ==== КБЖУ ПО СПИСКУ ====
+# ========= Рецепты (с «Назад») =========
+@bot.message_handler(func=lambda m: m.text == "👩‍🍳 Рецепты от ИИ")
+def recipes_entry(m):
+    reset_flow(m.from_user.id)
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("По названию блюда"), KeyboardButton("На калории"))
+    kb.row(KeyboardButton("⬅️ Назад"))
+    USER_FLOW[m.from_user.id] = {"step":"recipe_choice"}
+    bot.reply_to(m, "Как сгенерировать рецепт?", reply_markup=kb)
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "recipe_choice")
+def recipes_choice(m):
+    t = (m.text or "").strip().lower()
+    if t == "⬅️ назад":
+        reset_flow(m.from_user.id)
+        bot.send_message(m.chat.id, "Возвращаю в меню.", reply_markup=main_menu(m.from_user.id)); return
+    if t == "по названию блюда":
+        USER_FLOW[m.from_user.id] = {"step":"recipe_name"}
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row(KeyboardButton("⬅️ Назад"))
+        bot.reply_to(m, "Введи название блюда. Пример: «блинчики», «паста карбонара».", reply_markup=kb)
+    elif t == "на калории":
+        USER_FLOW[m.from_user.id] = {"step":"recipe_kcal"}
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row(KeyboardButton("⬅️ Назад"))
+        bot.reply_to(m, "Введи желаемую калорийность порции, например: 600", reply_markup=kb)
+    else:
+        bot.reply_to(m, "Выбери: «По названию блюда» или «На калории», либо нажми «⬅️ Назад».")
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "recipe_name")
+def recipe_by_name_gen(m):
+    if (m.text or "").strip().lower() == "⬅️ назад":
+        return recipes_entry(m)
+    name = m.text.strip()
+    send_recipe_text(m, name=name, kcal=None)
+    reset_flow(m.from_user.id)
+    bot.send_message(m.chat.id, "Готово ✅", reply_markup=main_menu(m.from_user.id))
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "recipe_kcal")
+def recipe_by_kcal_gen(m):
+    if (m.text or "").strip().lower() == "⬅️ назад":
+        return recipes_entry(m)
+    try:
+        kcal = int("".join(ch for ch in m.text if ch.isdigit()))
+    except:
+        bot.reply_to(m, "Нужно число, например 600"); return
+    send_recipe_text(m, name=None, kcal=kcal)
+    reset_flow(m.from_user.id)
+    bot.send_message(m.chat.id, "Готово ✅", reply_markup=main_menu(m.from_user.id))
+
+@bot.message_handler(func=lambda m: (m.text or "").strip().lower() == "⬅️ назад")
+def go_back(m):
+    reset_flow(m.from_user.id)
+    bot.send_message(m.chat.id, "Окей, вернул в меню.", reply_markup=main_menu(m.from_user.id))
+
+def send_recipe_text(m, name=None, kcal=None):
+    if not oa_client:
+        bot.reply_to(m, "LLM не подключён (нет OPENAI_API_KEY). Добавь ключ — и пришлю рецепт.")
+        return
+    if name:
+        sys = "Ты повар. Дай понятный рецепт на русском: ингредиенты с граммовками, пошаговая инструкция, примерные КБЖУ на порцию."
+        user = f"Нужен домашний рецепт блюда: {name}. Одна вариация, продукты из супермаркета, 1–2 порции."
+    else:
+        sys = "Ты повар. Дай рецепт одной порции на указанную калорийность (±10%), ингредиенты с граммовками, инструкция и КБЖУ."
+        user = f"Сформируй рецепт на одну порцию примерно на {kcal} ккал. Продукты обычные."
+    try:
+        resp = oa_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":sys},
+                      {"role":"user","content":user}],
+            temperature=0.4
+        )
+        bot.send_message(m.chat.id, resp.choices[0].message.content, reply_markup=main_menu(m.from_user.id))
+    except Exception as e:
+        bot.reply_to(m, f"Не удалось сгенерировать рецепт: {e}")
+        # ========= КБЖУ ПО ФОТО =========
+@bot.message_handler(func=lambda m: m.text == "📸 КБЖУ по фото", content_types=['text'])
+def kbju_photo_intro(m):
+    reset_flow(m.from_user.id)
+    state, deadline = ensure_trial_or_premium(m.from_user.id)
+    if state not in ("premium","trial_active","trial_started"):
+        price = get_current_price()
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton(f"Купить премиум за {price} ⭐", callback_data="buy_premium_stars"))
+        bot.reply_to(m, "⏳ Пробный период закончился. Чтобы анализировать фото — оформи премиум.", reply_markup=kb)
+        return
+    bot.reply_to(m, "Отправь фото блюда одним сообщением. Для точности можешь подписать ингредиенты и граммы.")
+
+@bot.message_handler(content_types=['photo'])
+def kbju_photo_calc(m):
+    state, _ = ensure_trial_or_premium(m.from_user.id)
+    if state not in ("premium","trial_active","trial_started"):
+        price = get_current_price()
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton(f"Купить премиум за {price} ⭐", callback_data="buy_premium_stars"))
+        bot.reply_to(m, "⏳ Пробный период закончился. Чтобы анализировать фото — оформи премиум.", reply_markup=kb)
+        return
+    bot.reply_to(m, "Фото получил 👍 Пока точнее считаю по списку продуктов. Пришли список — посчитаю.")
+
+# ========= КБЖУ ПО СПИСКУ =========
 @bot.message_handler(func=lambda m: m.text == "🧾 КБЖУ по списку")
 def kbju_list_intro(m):
+    reset_flow(m.from_user.id)
     state, deadline = ensure_trial_or_premium(m.from_user.id)
     if state == "premium":
         bot.reply_to(m, "Премиум активен ✅\nПришли список: «Овсянка 60 г; Молоко 200 мл; Банан 120 г».")
@@ -307,106 +411,49 @@ def kbju_list_intro(m):
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton(f"Купить премиум за {price} ⭐", callback_data="buy_premium_stars"))
         bot.reply_to(m, "⏳ Пробный период закончился. Чтобы продолжить — оформи премиум.", reply_markup=kb)
         return
-    USER_FLOW[m.from_user.id] = {"step":"list_wait"}  # ждём список в след. сообщении
+    USER_FLOW[m.from_user.id] = {"step":"list_wait"}  # ждём список текстом
 
-@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "list_wait")
+@bot.message_handler(
+    func=lambda m: USER_FLOW.get(m.from_user.id, {}).get("step") == "list_wait",
+    content_types=['text']
+)
 def kbju_list_calc(m):
-    items = llm_parse_foods(m.text)
+    txt = (m.text or "").strip()
+
+    # если жмут другую кнопку — мягко уходим из шага
+    if txt in ("📸 КБЖУ по фото", "🧾 КБЖУ по списку", "👩‍🍳 Рецепты от ИИ",
+               "ℹ️ Помощь", "⭐ Купить премиум", "📊 Проверить премиум",
+               "📅 Меню на неделю", "👨‍💻 Админка", "⬅️ Назад"):
+        reset_flow(m.from_user.id)
+        if txt == "📸 КБЖУ по фото":     return kbju_photo_intro(m)
+        if txt == "🧾 КБЖУ по списку":   return kbju_list_intro(m)
+        if txt == "👩‍🍳 Рецепты от ИИ":  return recipes_entry(m)
+        if txt == "ℹ️ Помощь":          return on_help(m)
+        if txt == "⭐ Купить премиум":   return buy_premium(m)
+        if txt == "📊 Проверить премиум":return check_premium(m)
+        if txt == "📅 Меню на неделю":  return week_menu_start(m)
+        if txt == "👨‍💻 Админка":       return admin_panel(m)
+        return bot.send_message(m.chat.id, "Окей, вернул в меню.", reply_markup=main_menu(m.from_user.id))
+
+    items = llm_parse_foods(txt)
     if not items:
         bot.reply_to(m, "Не понял список 🤔 Пришли так: «Кур. грудка 150 г; Рис 180 г; Салат 120 г».")
         return
+
     kcal, p, f, c, det = estimate_kbju(items)
     lines = [f"• {name} — {grams} г → {kcal_i} ккал (Б:{p_i} Ж:{f_i} У:{c_i})"
              for name, grams, kcal_i, p_i, f_i, c_i in det]
-    txt = "📊 Итог по списку:\n" + "\n".join(lines) + \
-          f"\n\nИТОГО: {kcal} ккал — Б:{p} Ж:{f} У:{c}"
-    USER_FLOW[m.from_user.id] = {}  # сброс состояния
-    bot.reply_to(m, txt, reply_markup=main_menu(m.from_user.id))
+    txt_out = "📊 Итог по списку:\n" + "\n".join(lines) + f"\n\nИТОГО: {kcal} ккал — Б:{p} Ж:{f} У:{c}"
+    reset_flow(m.from_user.id)
+    bot.reply_to(m, txt_out, reply_markup=main_menu(m.from_user.id))
 
-# ==== КБЖУ ПО ФОТО (плейсхолдер) ====
-@bot.message_handler(func=lambda m: m.text == "📸 КБЖУ по фото")
-def kbju_photo_intro(m):
-    state, deadline = ensure_trial_or_premium(m.from_user.id)
-    if state not in ("premium","trial_active","trial_started"):
-        price = get_current_price()
-        kb = InlineKeyboardMarkup().add(InlineKeyboardButton(f"Купить премиум за {price} ⭐", callback_data="buy_premium_stars"))
-        bot.reply_to(m, "⏳ Пробный период закончился. Чтобы анализировать фото — оформи премиум.", reply_markup=kb)
-        return
-    bot.reply_to(m, "Отправь фото блюда одним сообщением. Чтобы точнее — подпиши ингредиенты и примерные граммы.")
-
-@bot.message_handler(content_types=['photo'])
-def kbju_photo_calc(m):
-    state, _ = ensure_trial_or_premium(m.from_user.id)
-    if state not in ("premium","trial_active","trial_started"):
-        price = get_current_price()
-        kb = InlineKeyboardMarkup().add(InlineKeyboardButton(f"Купить премиум за {price} ⭐", callback_data="buy_premium_stars"))
-        bot.reply_to(m, "⏳ Пробный период закончился. Чтобы анализировать фото — оформи премиум.", reply_markup=kb)
-        return
-    # Тут можно подключить LLM-vision; пока — заглушка:
-    bot.reply_to(m, "Фото получил 👍 Я пока ориентируюсь на список продуктов. Пришли список — посчитаю точнее.")
-
-# ==== РЕЦЕПТЫ ОТ ИИ (бесплатно) ====
-@bot.message_handler(func=lambda m: m.text == "👩‍🍳 Рецепты от ИИ")
-def recipes_entry(m):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.row(KeyboardButton("По названию блюда"), KeyboardButton("На калории"))
-    bot.reply_to(m, "Как сгенерировать рецепт?", reply_markup=kb)
-    USER_FLOW[m.from_user.id] = {"step":"recipe_choice"}
-
-@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "recipe_choice")
-def recipes_choice(m):
-    t = m.text.strip().lower()
-    if t == "по названию блюда":
-        USER_FLOW[m.from_user.id] = {"step":"recipe_name"}
-        bot.reply_to(m, "Введи название блюда. Пример: «блинчики», «паста карбонара».")
-    elif t == "на калории":
-        USER_FLOW[m.from_user.id] = {"step":"recipe_kcal"}
-        bot.reply_to(m, "Введи желаемую калорийность порции, например: 600")
-    else:
-        bot.reply_to(m, "Выбери: «По названию блюда» или «На калории».")
-
-@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "recipe_name")
-def recipe_by_name_gen(m):
-    name = m.text.strip()
-    send_recipe_text(m, name=name, kcal=None)
-    USER_FLOW[m.from_user.id] = {}
-
-@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "recipe_kcal")
-def recipe_by_kcal_gen(m):
-    try:
-        kcal = int("".join(ch for ch in m.text if ch.isdigit()))
-    except:
-        bot.reply_to(m, "Нужно число, например 600"); return
-    send_recipe_text(m, name=None, kcal=kcal)
-    USER_FLOW[m.from_user.id] = {}
-
-def send_recipe_text(m, name=None, kcal=None):
-    if not oa_client:
-        bot.reply_to(m, "LLM не подключён (нет OPENAI_API_KEY). Добавь ключ — и пришлю рецепт.")
-        return
-    if name:
-        sys = "Ты повар. Дай понятный рецепт на русском: ингредиенты с граммовками, пошаговая инструкция, примерные КБЖУ на порцию."
-        user = f"Нужен домашний рецепт блюда: {name}. Одна вариация, продукты из супермаркета, 1–2 порции."
-    else:
-        sys = "Ты повар. Дай рецепт одной порции на указанную калорийность (±10%), ингредиенты с граммовками, инструкция и КБЖУ."
-        user = f"Сформируй рецепт на одну порцию примерно на {kcal} ккал. Продукты обычные, доступные в супермаркете."
-    try:
-        resp = oa_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":sys},
-                      {"role":"user","content":user}],
-            temperature=0.4
-        )
-        bot.send_message(m.chat.id, resp.choices[0].message.content, reply_markup=main_menu(m.from_user.id))
-    except Exception as e:
-        bot.reply_to(m, f"Не удалось сгенерировать рецепт: {e}")
-
-# ==== МЕНЮ НА НЕДЕЛЮ (анкета) ====
+# ========= Меню на неделю (анкета + премиум-проверка) =========
 def start_week_menu_wizard(uid):
     USER_FLOW[uid] = {"step":"weight","data":{}}
 
 @bot.message_handler(func=lambda m: m.text == "📅 Меню на неделю")
 def week_menu_start(m):
+    reset_flow(m.from_user.id)
     start_week_menu_wizard(m.from_user.id)
     bot.send_message(m.chat.id, "Введи свой вес (кг), только число. Пример: 72")
 
@@ -416,24 +463,31 @@ def week_menu_weight(m):
         w = float(m.text.replace(",", "."))
         USER_FLOW[m.from_user.id]["data"]["weight"] = w
         USER_FLOW[m.from_user.id]["step"] = "height"
-        bot.reply_to(m, "Теперь рост (см), только число. Пример: 178")
+        kb = ReplyKeyboardMarkup(resize_keyboard=True); kb.row(KeyboardButton("⬅️ Назад"))
+        bot.reply_to(m, "Теперь рост (см), только число. Пример: 178", reply_markup=kb)
     except:
         bot.reply_to(m, "Нужно число, например 72")
 
 @bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "height")
 def week_menu_height(m):
+    if (m.text or "").strip().lower() == "⬅️ назад":
+        return week_menu_start(m)
     try:
         h = float(m.text.replace(",", "."))
         USER_FLOW[m.from_user.id]["data"]["height"] = h
         USER_FLOW[m.from_user.id]["step"] = "goal"
-        kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
         kb.row(KeyboardButton("Похудение"), KeyboardButton("Поддержание веса"), KeyboardButton("Набор массы"))
+        kb.row(KeyboardButton("⬅️ Назад"))
         bot.reply_to(m, "Выбери цель:", reply_markup=kb)
     except:
         bot.reply_to(m, "Нужно число, например 178")
 
 @bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "goal")
 def week_menu_goal(m):
+    if (m.text or "").strip().lower() == "⬅️ назад":
+        USER_FLOW[m.from_user.id]["step"] = "height"
+        return bot.reply_to(m, "Вернулись. Введи рост (см).")
     goal = m.text.strip().lower()
     if goal not in ["похудение","поддержание веса","набор массы"]:
         bot.reply_to(m, "Выбери: Похудение | Поддержание веса | Набор массы"); return
@@ -443,6 +497,7 @@ def week_menu_goal(m):
 
     if has_premium(uid):
         plan = generate_week_menu_with_llm(USER_FLOW[uid]["data"], m.from_user.first_name or "пользователь")
+        reset_flow(uid)
         bot.send_message(m.chat.id, plan, reply_markup=main_menu(uid))
         return
 
@@ -451,6 +506,7 @@ def week_menu_goal(m):
     u["pending_menu"] = USER_FLOW[uid]["data"]; db[str(uid)] = u; _save(db)
     price = get_current_price()
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton(f"Купить премиум за {price} ⭐", callback_data="buy_premium_stars"))
+    reset_flow(uid)
     bot.send_message(m.chat.id,
         "🔒 Меню на неделю доступно с премиумом.\n"
         "Оформи премиум — и я сразу сгенерирую меню по твоей анкете.",
@@ -476,11 +532,10 @@ def generate_week_menu_with_llm(data, name="пользователь"):
         return resp.choices[0].message.content
     except Exception as e:
         return f"Не удалось сгенерировать меню: {e}"
-        # bot.py (Часть 4/4) — админка, авто-ресарт, запуск
-
-# ==== АДМИНКА ====
+        # ========= Админка =========
 @bot.message_handler(func=lambda m: m.text in ("👨‍💻 Админка","/admin"))
 def admin_panel(m):
+    reset_flow(m.from_user.id)
     if not is_admin(m.from_user.id):
         bot.reply_to(m, "⛔ Доступ запрещён.", reply_markup=main_menu(m.from_user.id)); return
     kb = InlineKeyboardMarkup()
@@ -527,7 +582,7 @@ def admin_grant_step(m):
         except: pass
     except Exception as e:
         bot.reply_to(m, f"⚠️ Ошибка: {e}")
-    USER_FLOW[m.from_user.id] = {}
+    reset_flow(m.from_user.id)
 
 @bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "adm_revoke")
 def admin_revoke_step(m):
@@ -542,7 +597,7 @@ def admin_revoke_step(m):
         except: pass
     except Exception as e:
         bot.reply_to(m, f"⚠️ Ошибка: {e}")
-    USER_FLOW[m.from_user.id] = {}
+    reset_flow(m.from_user.id)
 
 @bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "adm_price")
 def admin_price_step(m):
@@ -553,37 +608,39 @@ def admin_price_step(m):
         bot.reply_to(m, f"✅ Новая цена: {new_price} ⭐", reply_markup=main_menu(m.from_user.id))
     except Exception as e:
         bot.reply_to(m, f"⚠️ Ошибка: {e}")
-    USER_FLOW[m.from_user.id] = {}
+    reset_flow(m.from_user.id)
 
-# ==== авто-перезапуск и запуск ====
+# ========= Мини-веб (для Render Web Service) =========
+# Если сервис web — Render ожидает открытый порт. Этот мини-сервер решает проблему.
+try:
+    import flask
+    app = flask.Flask(__name__)
+
+    @app.route('/')
+    def index():
+        return "Bot is running!"
+
+    def run_web():
+        port = int(os.getenv("PORT", 10000))
+        app.run(host="0.0.0.0", port=port)
+    threading.Thread(target=run_web, daemon=True).start()
+except Exception:
+    pass  # если Flask не установлен — просто игнорируем (на worker не нужен)
+
+# ========= Авто-перезапуск раз в сутки (на всякий случай) =========
 def auto_restart():
     while True:
         time.sleep(24*3600)
         os._exit(0)
 threading.Thread(target=auto_restart, daemon=True).start()
 
+# ========= Запуск поллинга =========
 print("✅ Bot started")
 while True:
     try:
-        import threading
-import flask
-import os
-
-app = flask.Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Bot is running!"
-
-def run_web():
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_web).start()
         bot.infinity_polling(skip_pending=True, timeout=90)
     except KeyboardInterrupt:
         break
     except Exception as e:
         print("polling error:", e)
         time.sleep(3)
-    
