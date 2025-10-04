@@ -19,17 +19,23 @@ PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))  # 30 дней
 def _parse_admins():
     ids = set()
     if os.getenv("ADMIN_ID"):
-        try: ids.add(int(os.getenv("ADMIN_ID")))
-        except: pass
+        try:
+            ids.add(int(os.getenv("ADMIN_ID")))
+        except:
+            pass
     if os.getenv("ADMIN_IDS"):
         for x in os.getenv("ADMIN_IDS").split(","):
             x = x.strip()
-            if x.isdigit(): ids.add(int(x))
+            if x.isdigit():
+                ids.add(int(x))
+    # локальный запасной вариант (можно удалить в проде)
     if not ids:
         ids.add(123456789)  # <-- замени на свой ID или задай ADMIN_ID на Render
     return ids
+
 ADMIN_IDS = _parse_admins()
-def is_admin(user_id:int) -> bool:
+
+def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -44,7 +50,8 @@ DATA_FILE = "users.json"   # локальная БД (Render хранит фай
 # ====== БД ======
 def _load():
     if not os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "w", encoding="utf-8") as f: f.write("{}")
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            f.write("{}")
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -55,13 +62,13 @@ def _save(db):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
-def get_user(db, uid:int):
+def get_user(db, uid: int):
     s = str(uid)
     if s not in db:
         db[s] = {"joined": int(time.time()), "premium": False, "premium_until": 0}
     return db[s]
 
-def set_premium(uid:int, days:int):
+def set_premium(uid: int, days: int):
     db = _load()
     u = get_user(db, uid)
     now = int(time.time())
@@ -71,9 +78,11 @@ def set_premium(uid:int, days:int):
     db[str(uid)] = u
     _save(db)
 
-def has_premium(uid:int) -> bool:
-    db = _load(); u = db.get(str(uid))
-    if not u: return False
+def has_premium(uid: int) -> bool:
+    db = _load()
+    u = db.get(str(uid))
+    if not u:
+        return False
     if u["premium"] and u["premium_until"] > int(time.time()):
         return True
     # авто-сброс просроченного
@@ -83,7 +92,7 @@ def has_premium(uid:int) -> bool:
         _save(db)
     return False
 
-def log_payment(uid:int, stars:int, payload:str):
+def log_payment(uid: int, stars: int, payload: str):
     db = _load()
     db.setdefault("__payments__", []).append({
         "uid": uid, "stars": int(stars), "ts": int(time.time()), "payload": payload
@@ -92,21 +101,26 @@ def log_payment(uid:int, stars:int, payload:str):
 
 def get_current_price() -> int:
     # читаем «живую» цену из ENV (можно менять из админки без перезапуска)
-    try: return int(os.getenv("STAR_PRICE_PREMIUM", str(STAR_PRICE_PREMIUM_DEFAULT)))
-    except: return STAR_PRICE_PREMIUM_DEFAULT
+    try:
+        return int(os.getenv("STAR_PRICE_PREMIUM", str(STAR_PRICE_PREMIUM_DEFAULT)))
+    except:
+        return STAR_PRICE_PREMIUM_DEFAULT
 
 # ====== МЕНЮ ======
-def main_menu(user_id:int=None):
+def main_menu(user_id: int = None):
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(KeyboardButton("⭐ Купить премиум"), KeyboardButton("📊 Проверить премиум"))
-    kb.row(KeyboardButton("📅 Меню на неделю (премиум)")
+    kb.row(KeyboardButton("📅 Меню на неделю (премиум)"))
     if user_id and is_admin(user_id):
         kb.row(KeyboardButton("👨‍💻 Админка"))
     return kb
+
 # ====== ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ ======
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
-    db = _load(); get_user(db, m.from_user.id); _save(db)
+    db = _load()
+    get_user(db, m.from_user.id)
+    _save(db)
     print(f"/start from {m.from_user.id} @{m.from_user.username}")
     bot.send_message(
         m.chat.id,
@@ -118,7 +132,8 @@ def cmd_start(m):
 @bot.message_handler(func=lambda m: m.text == "📊 Проверить премиум")
 def check_premium(m):
     if has_premium(m.from_user.id):
-        db = _load(); u = db.get(str(m.from_user.id), {})
+        db = _load()
+        u = db.get(str(m.from_user.id), {})
         exp = datetime.datetime.fromtimestamp(u.get("premium_until", 0)).strftime("%d.%m.%Y")
         bot.reply_to(m, f"✅ Премиум активен до <b>{exp}</b>.", reply_markup=main_menu(m.from_user.id))
     else:
@@ -129,9 +144,9 @@ def buy_premium(m):
     price = get_current_price()
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton(f"Оплатить {price} ⭐", callback_data="buy_premium_stars"))
-    bot.send_message(m.chat.id,
-        f"Премиум на {PREMIUM_DAYS} дней открывает все функции.\n"
-        f"Цена: {price} ⭐",
+    bot.send_message(
+        m.chat.id,
+        f"Премиум на {PREMIUM_DAYS} дней открывает все функции.\nЦена: {price} ⭐",
         reply_markup=kb
     )
 
@@ -139,11 +154,17 @@ def buy_premium(m):
 @bot.message_handler(func=lambda m: m.text == "📅 Меню на неделю (премиум)")
 def week_menu_feature(m):
     if not has_premium(m.from_user.id):
-        bot.reply_to(m, "🔒 Эта функция доступна только с премиумом. Нажми «⭐ Купить премиум».",
-                     reply_markup=main_menu(m.from_user.id))
+        bot.reply_to(
+            m,
+            "🔒 Эта функция доступна только с премиумом. Нажми «⭐ Купить премиум».",
+            reply_markup=main_menu(m.from_user.id)
+        )
         return
-    bot.reply_to(m, "🧠 Здесь будет генерация меню на неделю (доступ открыт).",
-                 reply_markup=main_menu(m.from_user.id))
+    bot.reply_to(
+        m,
+        "🧠 Здесь будет генерация меню на неделю (доступ открыт).",
+        reply_markup=main_menu(m.from_user.id)
+    )
 
 # ====== АДМИНКА (видна только тебе) ======
 @bot.message_handler(func=lambda m: m.text in ("👨‍💻 Админка", "/admin"))
@@ -176,7 +197,7 @@ def admin_actions(c):
         bot.send_message(c.message.chat.id, f"👥 Всего пользователей: <b>{len([k for k in db.keys() if k!='__payments__'])}</b>")
     elif c.data == "adm_premiums":
         now = int(time.time())
-        active = sum(1 for u in db.values() if isinstance(u, dict) and u.get("premium") and u.get("premium_until",0) > now)
+        active = sum(1 for u in db.values() if isinstance(u, dict) and u.get("premium") and u.get("premium_until", 0) > now)
         bot.send_message(c.message.chat.id, f"💎 Активных премиумов: <b>{active}</b>")
     elif c.data == "adm_income":
         pays = db.get("__payments__", [])
@@ -194,7 +215,8 @@ def admin_actions(c):
         bot.register_next_step_handler(c.message, admin_price_step)
 
 def admin_grant_step(m):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id):
+        return
     try:
         parts = m.text.strip().split()
         uid = int(parts[0])
@@ -202,33 +224,44 @@ def admin_grant_step(m):
         set_premium(uid, days)
         bot.reply_to(m, f"✅ Выдан премиум пользователю <code>{uid}</code> на {days} дн.",
                      reply_markup=main_menu(m.from_user.id))
-        try: bot.send_message(uid, f"✅ Вам выдан премиум на {days} дней администратором.")
-        except: pass
+        try:
+            bot.send_message(uid, f"✅ Вам выдан премиум на {days} дней администратором.")
+        except:
+            pass
     except Exception as e:
         bot.reply_to(m, f"⚠️ Ошибка: {e}", reply_markup=main_menu(m.from_user.id))
 
 def admin_revoke_step(m):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id):
+        return
     try:
         uid = int(m.text.strip())
-        db = _load(); u = db.get(str(uid))
-        if not u: raise ValueError("Пользователь не найден")
-        u["premium"] = False; u["premium_until"] = 0
-        db[str(uid)] = u; _save(db)
+        db = _load()
+        u = db.get(str(uid))
+        if not u:
+            raise ValueError("Пользователь не найден")
+        u["premium"] = False
+        u["premium_until"] = 0
+        db[str(uid)] = u
+        _save(db)
         bot.reply_to(m, f"✅ Снят премиум у <code>{uid}</code>.", reply_markup=main_menu(m.from_user.id))
-        try: bot.send_message(uid, "❌ Ваш премиум был снят администратором.")
-        except: pass
+        try:
+            bot.send_message(uid, "❌ Ваш премиум был снят администратором.")
+        except:
+            pass
     except Exception as e:
         bot.reply_to(m, f"⚠️ Ошибка: {e}", reply_markup=main_menu(m.from_user.id))
 
 def admin_price_step(m):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id):
+        return
     try:
         new_price = int(m.text.strip())
         os.environ["STAR_PRICE_PREMIUM"] = str(new_price)  # обновим «на лету»
         bot.reply_to(m, f"✅ Новая цена установлена: {new_price} ⭐", reply_markup=main_menu(m.from_user.id))
     except Exception as e:
         bot.reply_to(m, f"⚠️ Ошибка: {e}", reply_markup=main_menu(m.from_user.id))
+
 # ====== ОПЛАТА TELEGRAM STARS (XTR) ======
 @bot.callback_query_handler(func=lambda c: c.data == "buy_premium_stars")
 def cb_buy_premium_stars(c):
@@ -261,8 +294,10 @@ def on_paid(m):
         total = getattr(sp, "total_amount", None)  # в Stars часто равно числу звёзд
         if payload.startswith("premium_stars:"):
             set_premium(m.from_user.id, PREMIUM_DAYS)
-            if total: log_payment(m.from_user.id, total, payload)
-            db = _load(); u = db.get(str(m.from_user.id), {})
+            if total:
+                log_payment(m.from_user.id, total, payload)
+            db = _load()
+            u = db.get(str(m.from_user.id), {})
             exp = datetime.datetime.fromtimestamp(u.get("premium_until", 0)).strftime("%d.%m.%Y")
             bot.send_message(
                 m.from_user.id,
@@ -270,7 +305,8 @@ def on_paid(m):
                 reply_markup=main_menu(m.from_user.id)
             )
         else:
-            if total: log_payment(m.from_user.id, total, payload)
+            if total:
+                log_payment(m.from_user.id, total, payload)
             bot.send_message(m.from_user.id, "✅ Оплата получена.", reply_markup=main_menu(m.from_user.id))
     except Exception as e:
         bot.send_message(m.chat.id, f"⚠️ Ошибка обработки платежа: {e}", reply_markup=main_menu(m.from_user.id))
@@ -278,7 +314,7 @@ def on_paid(m):
 # ====== АВТО-ПЕРЕЗАПУСК РАЗ В СУТКИ (на случай зависаний) ======
 def auto_restart():
     while True:
-        time.sleep(24*3600)
+        time.sleep(24 * 3600)
         os._exit(0)  # Render перезапустит процесс
 
 threading.Thread(target=auto_restart, daemon=True).start()
