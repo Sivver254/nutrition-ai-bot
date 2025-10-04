@@ -559,8 +559,9 @@ def on_paid(m):
 def run_web():
     try:
         from flask import Flask
+        WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
         app = Flask(__name__)
-        @app.get("/")
+        @app.route("/")
         def index(): return "Bot is running"
         port = int(os.getenv("PORT", "10000"))
         app.run(host="0.0.0.0", port=port)
