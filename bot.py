@@ -961,8 +961,8 @@ if __name__ == "__main__":
     # Авто-ребут
     threading.Thread(target=auto_restart, daemon=True).start()
 
-    print("✅ Bot started")
-        if __name__ == "__main__":
+    print("✅ Bot started")                                                                                  
+if __name__ == "__main__":
     # Снять вебхук на всякий случай, чтобы polling не конфликтовал
     try:
         bot.remove_webhook(drop_pending_updates=True)
