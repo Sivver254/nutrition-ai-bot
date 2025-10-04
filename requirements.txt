@@ -2,4 +2,4 @@ pyTelegramBotAPI==4.29.1
 requests
 pillow
 flask
-openai>=1.30.0
+openai>=1.40.0
