@@ -565,6 +565,21 @@ threading.Thread(target=auto_restart, daemon=True).start()
 print("✅ Bot started")
 while True:
     try:
+        import threading
+import flask
+import os
+
+app = flask.Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Bot is running!"
+
+def run_web():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_web).start()
         bot.infinity_polling(skip_pending=True, timeout=90)
     except KeyboardInterrupt:
         break
