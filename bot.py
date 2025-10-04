@@ -1,4 +1,4 @@
-# bot.py — Nutrition AI Bot (полная версия)
+# bot.py — Nutrition AI Bot (Telegram Stars + Trial + Recipes + Week Menu)
 
 import os, json, time, datetime, threading, re
 import telebot
@@ -14,7 +14,7 @@ if not BOT_TOKEN:
 
 STAR_PRICE_PREMIUM_DEFAULT = int(os.getenv("STAR_PRICE_PREMIUM", "100"))
 PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
-TRIAL_HOURS = 24  # бесплатный доступ к КБЖУ (24 часа с момента первого использования)
+TRIAL_HOURS = 24  # бесплатный доступ к КБЖУ (24 часа с первого использования)
 
 # Админы
 def _parse_admins():
@@ -121,7 +121,7 @@ def ensure_trial_or_premium(uid:int):
         return ("trial_started", u["trial_started_at"] + TRIAL_HOURS*3600)
     return ("denied", None)
 
-# ========= Небольшая нутри-база + «ИИ» парсер =========
+# ========= Нутри-база + ИИ-парсер =========
 NUTRI_BASE = {
     "куриная грудка": {"kcal":165,"p":31,"f":3.6,"c":0},
     "рис":            {"kcal":340,"p":7,"f":1,"c":76},
@@ -134,18 +134,37 @@ NUTRI_BASE = {
 }
 def norm_name(s:str)->str: return re.sub(r"\s+"," ",s.strip().lower())
 
+def _sanitize_items(items):
+    """Приводим ответ к виду [{'name': str, 'grams': int}, ...]."""
+    out = []
+    if not isinstance(items, (list, tuple)):
+        return out
+    for x in items:
+        if isinstance(x, dict):
+            name = norm_name(str(x.get("name", "")).strip())
+            graw = str(x.get("grams", "")).strip()
+            m = re.search(r"\d+", graw)
+            grams = int(m.group(0)) if m else 0
+            if name and grams > 0:
+                out.append({"name": name, "grams": grams})
+        elif isinstance(x, str):
+            m = re.search(r"([А-Яа-яA-Za-zёЁ\s]+)\s+(\d+)", x)
+            if m:
+                out.append({"name": norm_name(m.group(1)), "grams": int(m.group(2))})
+    return out
+
 def llm_parse_foods(text:str):
-    """вернёт [{"name":"овсянка","grams":60}, ...]"""
+    """вернёт список словарей [{'name','grams'}], даже если LLM вернул мусор."""
     if not oa_client:
         items = []
         for p in re.split(r"[;,\n]+", text):
             m = re.search(r"([А-Яа-яA-Za-zёЁ\s]+)\s+(\d+)\s*(г|гр|грамм|ml|мл)?", p.strip())
             if m: items.append({"name": norm_name(m.group(1)), "grams": int(m.group(2))})
-        return items
+        return _sanitize_items(items)
+
     prompt = (
         "Ты нутрициолог. Разбери русский текст на продукты с массами в граммах.\n"
-        'Верни только JSON-массив элементов вида {"name":"название","grams":число}.\n'
-        "Если масса не указана — оцени типичную порцию."
+        'Верни ТОЛЬКО JSON-массив вида [{"name":"название","grams":число}, ...] без пояснений.'
     )
     try:
         resp = oa_client.chat.completions.create(
@@ -154,14 +173,17 @@ def llm_parse_foods(text:str):
                       {"role":"user","content":text}],
             temperature=0.1
         )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
         import json as _json
-        return _json.loads(resp.choices[0].message.content)
+        data = _json.loads(raw)
+        return _sanitize_items(data)
     except Exception:
         items = []
         for p in re.split(r"[;,\n]+", text):
             m = re.search(r"([А-Яа-яA-Za-zёЁ\s]+)\s+(\d+)\s*(г|гр|грамм|ml|мл)?", p.strip())
             if m: items.append({"name": norm_name(m.group(1)), "grams": int(m.group(2))})
-        return items
+        return _sanitize_items(items)
 
 def estimate_kbju(items):
     total = {"kcal":0.0,"p":0.0,"f":0.0,"c":0.0}
@@ -188,11 +210,9 @@ def estimate_kbju(items):
         details.append((n, int(g), round(kcal), round(p,1), round(f,1), round(c,1)))
     return round(total["kcal"]), round(total["p"],1), round(total["f"],1), round(total["c"],1), details
 
-# ========= Состояния диалога =========
+# ========= Состояния =========
 USER_FLOW = {}  # uid -> {"step": "...", "data": {...}}
-
 def reset_flow(uid: int):
-    """Полностью очищает состояние пользователя (антизалипание)."""
     if uid in USER_FLOW:
         USER_FLOW.pop(uid, None)
         # ========= Меню =========
@@ -213,7 +233,7 @@ def cmd_start(m):
     text = (
         "Привет! 🤖 Я помогу посчитать КБЖУ еды:\n"
         "• «📸 КБЖУ по фото» — пришли фото блюда\n"
-        "• «🧾 КБЖУ по списку» — просто напиши продукты и граммы\n\n"
+        "• «🧾 КБЖУ по списку» — напиши продукты и граммы\n\n"
         "Также могу подобрать <b>меню на 7 дней</b> под твои параметры — «📅 Меню на неделю».\n"
         "«👩‍🍳 Рецепты от ИИ» — бесплатно. Премиум открывает доп. функции на 30 дней."
     )
@@ -226,12 +246,12 @@ def on_help(m):
         "Как пользоваться:\n"
         "• «📸 КБЖУ по фото» — отправь фото (триал 24ч, затем премиум)\n"
         "• «🧾 КБЖУ по списку» — пример: «Овсянка 60 г; Молоко 200 мл; Банан 120 г» (триал 24ч)\n"
-        "• «👩‍🍳 Рецепты от ИИ» — бесплатные рецепты по названию или на заданные калории\n"
+        "• «👩‍🍳 Рецепты от ИИ» — рецепты по названию или на заданные калории\n"
         "• «📅 Меню на неделю» — заполни анкету, если нет премиума — предложу оплату XTR",
         reply_markup=main_menu(m.from_user.id)
     )
 
-# ========= Премиум =========
+# ========= Премиум / Stars =========
 @bot.message_handler(func=lambda m: m.text == "📊 Проверить премиум")
 def check_premium(m):
     reset_flow(m.from_user.id)
@@ -289,7 +309,7 @@ def on_paid(m):
                 bot.send_message(m.chat.id, plan, reply_markup=main_menu(m.from_user.id))
             else:
                 exp = datetime.datetime.fromtimestamp(u.get("premium_until",0)).strftime("%d.%m.%Y")
-                bot.send_message(m.chat.id, f"✅ Оплата получена! Премиум активен до <b>{exp}</b>.",
+                bot.send_message(m.chat.id, f"✅ Премиум активен до <b>{exp}</b>.",
                                  reply_markup=main_menu(m.from_user.id))
         else:
             if total: log_payment(m.from_user.id, total, payload)
@@ -315,21 +335,18 @@ def recipes_choice(m):
         bot.send_message(m.chat.id, "Возвращаю в меню.", reply_markup=main_menu(m.from_user.id)); return
     if t == "по названию блюда":
         USER_FLOW[m.from_user.id] = {"step":"recipe_name"}
-        kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.row(KeyboardButton("⬅️ Назад"))
+        kb = ReplyKeyboardMarkup(resize_keyboard=True); kb.row(KeyboardButton("⬅️ Назад"))
         bot.reply_to(m, "Введи название блюда. Пример: «блинчики», «паста карбонара».", reply_markup=kb)
     elif t == "на калории":
         USER_FLOW[m.from_user.id] = {"step":"recipe_kcal"}
-        kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.row(KeyboardButton("⬅️ Назад"))
+        kb = ReplyKeyboardMarkup(resize_keyboard=True); kb.row(KeyboardButton("⬅️ Назад"))
         bot.reply_to(m, "Введи желаемую калорийность порции, например: 600", reply_markup=kb)
     else:
-        bot.reply_to(m, "Выбери: «По названию блюда» или «На калории», либо нажми «⬅️ Назад».")
+        bot.reply_to(m, "Выбери пункт или нажми «⬅️ Назад».")
 
 @bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "recipe_name")
 def recipe_by_name_gen(m):
-    if (m.text or "").strip().lower() == "⬅️ назад":
-        return recipes_entry(m)
+    if (m.text or "").strip().lower() == "⬅️ назад": return recipes_entry(m)
     name = m.text.strip()
     send_recipe_text(m, name=name, kcal=None)
     reset_flow(m.from_user.id)
@@ -337,8 +354,7 @@ def recipe_by_name_gen(m):
 
 @bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step") == "recipe_kcal")
 def recipe_by_kcal_gen(m):
-    if (m.text or "").strip().lower() == "⬅️ назад":
-        return recipes_entry(m)
+    if (m.text or "").strip().lower() == "⬅️ назад": return recipes_entry(m)
     try:
         kcal = int("".join(ch for ch in m.text if ch.isdigit()))
     except:
@@ -358,15 +374,14 @@ def send_recipe_text(m, name=None, kcal=None):
         return
     if name:
         sys = "Ты повар. Дай понятный рецепт на русском: ингредиенты с граммовками, пошаговая инструкция, примерные КБЖУ на порцию."
-        user = f"Нужен домашний рецепт блюда: {name}. Одна вариация, продукты из супермаркета, 1–2 порции."
+        user = f"Нужен домашний рецепт блюда: {name}. Продукты из супермаркета, 1–2 порции."
     else:
         sys = "Ты повар. Дай рецепт одной порции на указанную калорийность (±10%), ингредиенты с граммовками, инструкция и КБЖУ."
         user = f"Сформируй рецепт на одну порцию примерно на {kcal} ккал. Продукты обычные."
     try:
         resp = oa_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":sys},
-                      {"role":"user","content":user}],
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
             temperature=0.4
         )
         bot.send_message(m.chat.id, resp.choices[0].message.content, reply_markup=main_menu(m.from_user.id))
@@ -436,6 +451,7 @@ def kbju_list_calc(m):
         return bot.send_message(m.chat.id, "Окей, вернул в меню.", reply_markup=main_menu(m.from_user.id))
 
     items = llm_parse_foods(txt)
+    items = _sanitize_items(items)  # важный шаг!
     if not items:
         bot.reply_to(m, "Не понял список 🤔 Пришли так: «Кур. грудка 150 г; Рис 180 г; Салат 120 г».")
         return
@@ -611,7 +627,6 @@ def admin_price_step(m):
     reset_flow(m.from_user.id)
 
 # ========= Мини-веб (для Render Web Service) =========
-# Если сервис web — Render ожидает открытый порт. Этот мини-сервер решает проблему.
 try:
     import flask
     app = flask.Flask(__name__)
@@ -625,9 +640,9 @@ try:
         app.run(host="0.0.0.0", port=port)
     threading.Thread(target=run_web, daemon=True).start()
 except Exception:
-    pass  # если Flask не установлен — просто игнорируем (на worker не нужен)
+    pass  # если Flask не установлен — игнор (на worker не нужен)
 
-# ========= Авто-перезапуск раз в сутки (на всякий случай) =========
+# ========= Авто-перезапуск раз в сутки =========
 def auto_restart():
     while True:
         time.sleep(24*3600)
