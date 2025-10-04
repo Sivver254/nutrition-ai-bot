@@ -1,531 +1,474 @@
-# bot.py (часть 1/4) — конфиг, база, хелперы
-import os, json, time, math, threading, datetime
+# bot.py — Calories AI (webhook, AI vision, weekly plan, recipes)
+import os, json, time, datetime, threading, math, re
+from uuid import uuid4
+
 import telebot
 from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
 )
 
-# ===== Конфиг =====
+# ====== CONFIG ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is not set")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # нужен для ИИ и фото
+# Premium price/duration (env-override)
+STAR_PRICE_PREMIUM_DEFAULT = int(os.getenv("STAR_PRICE_PREMIUM", "100"))  # ⭐
 PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
-STAR_PRICE_PREMIUM_DEFAULT = int(os.getenv("STAR_PRICE_PREMIUM", "100"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
+EXTERNAL_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")  # nutrition-ai-bot.onrender.com
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # опционально
 
-ADMIN_IDS = set()
-if os.getenv("ADMIN_ID"):
-    try: ADMIN_IDS.add(int(os.getenv("ADMIN_ID")))
-    except: pass
-if os.getenv("ADMIN_IDS"):
-    for x in os.getenv("ADMIN_IDS").split(","):
-        x=x.strip()
-        if x.isdigit(): ADMIN_IDS.add(int(x))
-if not ADMIN_IDS:
-    ADMIN_IDS.add(123456789)  # подстраховка
+# Admins
+def _parse_admins():
+    ids = set()
+    if os.getenv("ADMIN_ID"):
+        try: ids.add(int(os.getenv("ADMIN_ID")))
+        except: pass
+    if os.getenv("ADMIN_IDS"):
+        for x in os.getenv("ADMIN_IDS").split(","):
+            x = x.strip()
+            if x.isdigit(): ids.add(int(x))
+    if not ids:
+        ids.add(123456789)  # поменяй либо задай ADMIN_ID/ADMIN_IDS
+    return ids
 
+ADMIN_IDS = _parse_admins()
 def is_admin(uid:int)->bool: return uid in ADMIN_IDS
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ===== "БД" =====
-DATA_FILE = "users.json"
+DATA_FILE = "users.json"      # локальная БД
+WELCOME_FILE = "welcome.txt"  # текст приветствия
+
+# ====== БД ======
 def _load():
     if not os.path.exists(DATA_FILE):
-        with open(DATA_FILE,"w",encoding="utf-8") as f: f.write("{}")
+        with open(DATA_FILE, "w", encoding="utf-8") as f: f.write("{}")
     try:
-        return json.load(open(DATA_FILE,"r",encoding="utf-8"))
-    except: return {}
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
 def _save(db):
-    json.dump(db, open(DATA_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
 
 def get_user(db, uid:int):
-    s=str(uid)
+    s = str(uid)
     if s not in db:
         db[s] = {
             "joined": int(time.time()),
-            "premium": False, "premium_until":0,
-            "trial_until": 0,                    # пробный 24 часа для бесплатных КБЖУ
-            "profile": {}                        # анкета
+            "premium": False,
+            "premium_until": 0,
+            "trial_started": 0,
+            "profile": { "sex": None, "height": None, "weight": None, "goal": None },
+            "last_features": {},
         }
     return db[s]
 
 def set_premium(uid:int, days:int):
-    db=_load(); u=get_user(db, uid)
-    now=int(time.time()); base=u["premium_until"] if u["premium_until"]>now else now
-    u["premium_until"]=base+days*86400; u["premium"]=True
-    db[str(uid)]=u; _save(db)
+    db = _load()
+    u = get_user(db, uid)
+    now = int(time.time())
+    base = u["premium_until"] if u["premium_until"] > now else now
+    u["premium_until"] = base + days*86400
+    u["premium"] = True
+    db[str(uid)] = u
+    _save(db)
 
-def has_premium(uid:int)->bool:
+def get_current_price() -> int:
+    try: return int(os.getenv("STAR_PRICE_PREMIUM", str(STAR_PRICE_PREMIUM_DEFAULT)))
+    except: return STAR_PRICE_PREMIUM_DEFAULT
+
+def has_premium(uid:int) -> bool:
+    # админам — всегда True
     if is_admin(uid): return True
-    db=_load(); u=db.get(str(uid))
+    db = _load(); u = db.get(str(uid))
     if not u: return False
-    if u["premium"] and u["premium_until"]>int(time.time()): return True
-    if u["premium"] and u["premium_until"]<=int(time.time()):
-        u["premium"]=False; db[str(uid)]=u; _save(db)
+    if u["premium"] and u["premium_until"] > int(time.time()):
+        return True
+    # авто-сброс
+    if u["premium"] and u["premium_until"] <= int(time.time()):
+        u["premium"] = False
+        db[str(uid)] = u; _save(db)
     return False
 
-def mark_trial(uid:int, hours=24):
-    db=_load(); u=get_user(db, uid)
-    u["trial_until"]=int(time.time())+hours*3600
-    db[str(uid)]=u; _save(db)
+def start_trial_if_needed(uid:int):
+    db = _load(); u = get_user(db, uid)
+    if u["trial_started"] == 0:
+        u["trial_started"] = int(time.time())
+        db[str(uid)] = u; _save(db)
 
-def has_trial(uid:int)->bool:
+def trial_active(uid:int) -> bool:
     if is_admin(uid): return True
-    db=_load(); u=db.get(str(uid))
-    return bool(u and u.get("trial_until",0)>int(time.time()))
+    db = _load(); u = get_user(db, uid)
+    ts = u.get("trial_started", 0)
+    return ts != 0 and (int(time.time()) - ts) < 24*3600
 
 def log_payment(uid:int, stars:int, payload:str):
-    db=_load()
+    db = _load()
     db.setdefault("__payments__", []).append({
         "uid": uid, "stars": int(stars), "ts": int(time.time()), "payload": payload
     })
     _save(db)
 
-def get_current_price()->int:
-    try: return int(os.getenv("STAR_PRICE_PREMIUM", str(STAR_PRICE_PREMIUM_DEFAULT)))
-    except: return STAR_PRICE_PREMIUM_DEFAULT
-
-# ===== UI =====
-MAIN_BTNS = {
-    "buy": "⭐ Купить премиум",
-    "check": "📊 Проверить премиум",
-    "photo": "📸 КБЖУ по фото",
-    "list": "🧾 КБЖУ по списку",
-    "menu": "📅 Меню на неделю",
-    "recipes": "👨‍🍳 Рецепты от ИИ",
-    "back": "⬅️ Назад",
-    "admin": "👨‍💻 Админка"
-}
-
-def main_menu(uid:int=None):
-    kb=ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton(MAIN_BTNS["buy"]), KeyboardButton(MAIN_BTNS["check"]))
-    kb.row(KeyboardButton(MAIN_BTNS["photo"]), KeyboardButton(MAIN_BTNS["list"]))
-    kb.row(KeyboardButton(MAIN_BTNS["menu"]))
-    kb.row(KeyboardButton(MAIN_BTNS["recipes"]))
-    if uid and is_admin(uid):
-        kb.row(KeyboardButton(MAIN_BTNS["admin"]))
-    return kb
-
-def back_menu(): 
-    kb=ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton(MAIN_BTNS["back"]))
-    return kb
-
-def send_typing(chat_id, kind="typing", seconds=2):
-    # kind: typing, upload_photo, choose_sticker...
-    try:
-        for _ in range(seconds):
-            bot.send_chat_action(chat_id, kind)
-            time.sleep(1)
-    except: pass
-
-# временные статусы «Создаю…»
-def temp_message(chat_id, text):
-    try: 
-        m = bot.send_message(chat_id, text)
-        return (m.chat.id, m.message_id)
-    except:
-        return (None, None)
-def delete_temp(msg_tuple):
-    cid, mid = msg_tuple
-    if cid and mid:
-        try: bot.delete_message(cid, mid)
-        except: pass
-            # bot.py (часть 2/4)
-
-WELCOME = (
-    "Привет! 🤖 Я помогу посчитать КБЖУ еды:\n"
-    "• «📸 КБЖУ по фото» — пришли фото блюда\n"
-    "• «🧾 КБЖУ по списку» — напиши продукты и граммовку\n\n"
-    "Также сделаю меню на 7 дней под твои параметры — «📅 Меню на неделю».\n"
-    "«👨‍🍳 Рецепты от ИИ» — бесплатно. Премиум открывает доп. функции на 30 дней."
-)
-
-@bot.message_handler(commands=["start"])
-def cmd_start(m):
-    db=_load(); get_user(db, m.from_user.id); _save(db)
-    if is_admin(m.from_user.id):  # админам всегда премиум
-        set_premium(m.from_user.id, 3650)
-    bot.send_message(m.chat.id, WELCOME, reply_markup=main_menu(m.from_user.id))
-
-@bot.message_handler(func=lambda x: x.text==MAIN_BTNS["check"])
-def check_premium(m):
-    if has_premium(m.from_user.id):
-        u=_load().get(str(m.from_user.id),{})
-        exp=datetime.datetime.fromtimestamp(u.get("premium_until",0)).strftime("%d.%m.%Y")
-        bot.reply_to(m, f"✅ Премиум активен до <b>{exp}</b>.", reply_markup=main_menu(m.from_user.id))
-    else:
-        bot.reply_to(m, "❌ Премиум не активен.", reply_markup=main_menu(m.from_user.id))
-
-@bot.message_handler(func=lambda x: x.text==MAIN_BTNS["buy"])
-def buy_premium(m):
-    price=get_current_price()
-    kb=InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(f"Оплатить {price} ⭐", callback_data="buy_stars"))
-    bot.send_message(m.chat.id,
-        f"Премиум на {PREMIUM_DAYS} дней открывает все функции.\nЦена: {price} ⭐",
-        reply_markup=kb
+# ====== WELCOME TEXT ======
+def get_welcome_text() -> str:
+    default = (
+        "Привет! 🤖 Я помогу посчитать КБЖУ еды:\n"
+        "• «📸 КБЖУ по фото» — пришли фото блюда\n"
+        "• «🧾 КБЖУ по списку» — напиши продукты и граммы\n\n"
+        "Также подберу <b>меню на 7 дней</b> под твои параметры — «📅 Меню на неделю».\n"
+        "«👨‍🍳 Рецепты от ИИ» — бесплатно.\n\n"
+        "Премиум открывает доп. функции на 30 дней."
     )
+    if not os.path.exists(WELCOME_FILE):
+        with open(WELCOME_FILE, "w", encoding="utf-8") as f: f.write(default)
+        return default
+    try:
+        with open(WELCOME_FILE, "r", encoding="utf-8") as f:
+            t = f.read().strip()
+            return t or default
+    except:
+        return default
 
-# ===== Рецепты от ИИ (статус + ИИ) =====
-def ai_call(prompt:str)->str:
-    """
-    Универсальный вызов чата OpenAI. Нужен OPENAI_API_KEY.
-    Возвращает текст. Если ключа нет — фолбэк.
-    """
-    if not OPENAI_API_KEY:
-        return "⚠️ ИИ недоступен (нет OPENAI_API_KEY)."
+def set_welcome_text(new_text:str):
+    with open(WELCOME_FILE, "w", encoding="utf-8") as f:
+        f.write(new_text.strip())
+
+# ====== OpenAI helpers (мягкие заглушки, если нет ключа) ======
+def ai_available() -> bool:
+    return bool(OPENAI_API_KEY)
+
+def ai_summarize(prompt:str, system:str="Ты нутрициолог. Пиши коротко и по делу.") -> str:
+    if not ai_available():
+        # мягкая заглушка
+        return "⚠️ ИИ временно недоступен. Попробуй позже."
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.chat.completions.create(
+        chat = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":"Ты нутрициолог и шеф-повар. Пиши чётко и по делу."},
-                      {"role":"user","content":prompt}]
+            messages=[
+                {"role":"system", "content":system},
+                {"role":"user", "content":prompt}
+            ],
+            temperature=0.4,
+            max_tokens=600
         )
-        return resp.choices[0].message.content.strip()
+        return chat.choices[0].message.content.strip()
     except Exception as e:
         return f"⚠️ ИИ ошибка: {e}"
 
-@bot.message_handler(func=lambda x: x.text==MAIN_BTNS["recipes"])
-def recipes_menu(m):
-    kb=InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Рецепт на 600 ккал", callback_data="rx_600"))
-    kb.add(InlineKeyboardButton("Рецепт по запросу", callback_data="rx_custom"))
-    bot.send_message(m.chat.id, "Выбери вариант:", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data in ("rx_600","rx_custom"))
-def recipes_actions(c):
-    if c.data=="rx_600":
-        t = temp_message(c.message.chat.id, "🍳 Создаю рецепт…")
-        send_typing(c.message.chat.id, "typing", 2)
-        txt = ai_call("Сделай простой рецепт на ~600 ккал. Дай ингредиенты с граммовкой, шаги и К/Б/Ж/У в конце.")
-        delete_temp(t)
-        bot.send_message(c.message.chat.id, txt, reply_markup=main_menu(c.from_user.id))
-    else:
-        bot.answer_callback_query(c.id)
-        msg = bot.send_message(c.message.chat.id, "Напиши, какой рецепт тебе нужен (вкус/продукты/калории)…", reply_markup=back_menu())
-        bot.register_next_step_handler(msg, recipe_custom_step)
-
-def recipe_custom_step(m):
-    if m.text==MAIN_BTNS["back"]:
-        bot.send_message(m.chat.id, "Окей, вернул в меню.", reply_markup=main_menu(m.from_user.id)); return
-    t = temp_message(m.chat.id, "🍳 Создаю рецепт…")
-    send_typing(m.chat.id, "typing", 3)
-    txt = ai_call(f"Сделай рецепт по описанию: «{m.text}». Обязательно укажи порции, ингредиенты, шаги и К/Б/Ж/У.")
-    delete_temp(t)
-    bot.send_message(m.chat.id, txt, reply_markup=main_menu(m.from_user.id))
-
-# ===== КБЖУ по списку =====
-def parse_list_to_items(text:str):
+def ai_vision_estimate_kbju(image_url:str, hint_text:str="") -> dict:
     """
-    Пытается понять строки типа:
-    'Кур. грудка 150 г; Рис 180 г; Салат 120 г'
-    Возвращает список словарей [{'name':..., 'gram':...}, ...]
+    Возвращает дикт: {"kcal": int, "p":int, "f":int, "c":int, "title": "Блюдо", "items":[...]}
     """
-    raw = [p.strip() for p in text.replace("\n"," ").split(";") if p.strip()]
-    items=[]
-    for p in raw:
-        # мягкий разбор, ИИ-поддержка
-        grams = None
-        name = p
-        # выцепим число граммов
-        import re
-        g = re.search(r'(\d+)\s*(г|гр|грам|грамм|grams?)?', p, re.I)
-        if g:
-            grams = int(g.group(1))
-            name = p[:g.start()].strip() or p[g.end():].strip()
-        if not grams:
-            # попросим ИИ догадаться
-            guess = ai_call(f"В фразе «{p}» найди целое число граммов, верни только число. Если нет — 0.")
-            try: grams = int(guess)
-            except: grams = 0
-        name = name.strip(" ,.-")
-        if not name:
-            name = ai_call(f"В фразе «{p}» выдели название продукта (кратко). Верни только название.")
-        if grams<=0:
-            return None, f"Не понял позицию: «{p}»"
-        items.append({"name": name, "gram": grams})
-    return items, None
-
-def estimate_kbju_items(items):
-    """
-    Простейший расчёт через ИИ (можно заменить на твою таблицу).
-    На вход: [{'name','gram'}]. Возвращает (кал,б,ж,у,детализация)
-    """
-    if not OPENAI_API_KEY:
-        # фолбэк
-        kcal = sum(max(int(i["gram"]*1.2), 0) for i in items)
-        return kcal, round(kcal/10), round(kcal/20), round(kcal/6), "⚠️ Грубая оценка без ИИ."
-
-    prompt = (
-        "Оцени К/Б/Ж/У для списка продуктов с граммовкой. "
-        "Дай точные числа и краткую сводку.\n\n"
-        + "\n".join([f"- {it['name']} {it['gram']} г" for it in items]) +
-        "\n\nФормат ответа:\n"
-        "Итог: ХХХ ккал, Б/Ж/У: B/G/C\n"
-        "По позициям: ... (кратко)\n"
-    )
-    txt = ai_call(prompt)
-    # Поверим на слово ИИ и вернём текст. Для интерфейса понадобятся числа:
-    import re
-    kcal = re.search(r'(\d{2,5})\s*ккал', txt)
-    b = re.search(r'Б[:\s]*([0-9]+)', txt, re.I)
-    g = re.search(r'Ж[:\s]*([0-9]+)', txt, re.I)
-    c = re.search(r'У[:\s]*([0-9]+)', txt, re.I)
-    K = int(kcal.group(1)) if kcal else 0
-    B = int(b.group(1)) if b else 0
-    G = int(g.group(1)) if g else 0
-    C = int(c.group(1)) if c else 0
-    return K, B, G, C, txt
-
-@bot.message_handler(func=lambda x: x.text==MAIN_BTNS["list"])
-def kbju_list_prompt(m):
-    if not (has_premium(m.from_user.id) or has_trial(m.from_user.id)):
-        mark_trial(m.from_user.id, 24)
-        bot.send_message(m.chat.id, "Пробный доступ активен ✅\nПришли список в формате: «Продукт 120 г; …».", reply_markup=back_menu())
-    else:
-        bot.send_message(m.chat.id, "Пришли список в формате: «Продукт 120 г; …».", reply_markup=back_menu())
-    bot.register_next_step_handler(m, kbju_list_calc)
-
-def kbju_list_calc(m):
-    if m.text==MAIN_BTNS["back"]:
-        bot.send_message(m.chat.id, "Ок, вернул в меню.", reply_markup=main_menu(m.from_user.id)); return
-    items, err = parse_list_to_items(m.text)
-    if err:
-        bot.send_message(m.chat.id, f"⚠️ Ошибка: {err}\nПопробуй ещё раз.", reply_markup=back_menu())
-        bot.register_next_step_handler(m, kbju_list_calc); return
-    t=temp_message(m.chat.id, "🧮 Считаю КБЖУ…")
-    send_typing(m.chat.id, "typing", 2)
-    kcal,B,G,C,detail = estimate_kbju_items(items)
-    delete_temp(t)
-    lines = [f"<b>Итог:</b> ~{kcal} ккал, Б/Ж/У: {B}/{G}/{C}", "", "<b>Детали:</b>", detail]
-    bot.send_message(m.chat.id, "\n".join(lines), reply_markup=main_menu(m.from_user.id))
-    # bot.py (часть 3/4)
-
-# ===== КБЖУ по фото (OpenAI Vision) =====
-def ai_vision_kbju(photo_url:str)->str:
-    """
-    Отправляет URL фото в модель, просит назвать блюдо/ингредиенты и оценить КБЖУ.
-    Вернёт готовый текст.
-    """
-    if not OPENAI_API_KEY:
-        return "⚠️ ИИ-визион недоступен (нет OPENAI_API_KEY)."
+    if not ai_available():
+        # простая заглушка
+        return {"kcal": 520, "p": 32, "f": 18, "c": 50, "title": "Блюдо (пример)", "items": ["пример ингредиентов"]}
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = (
-            "Определи блюдо по фото, перечисли 3–6 ключевых ингредиентов.\n"
-            "Затем оцени суммарные К/Б/Ж/У порции. Выведи так:\n"
-            "Название: ...\nИнгредиенты: ...\nИтог: ХХХ ккал; Б/Ж/У: B/G/C\n"
-        )
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"Ты нутрициолог. Будь краток и точен."},
-                {"role":"user","content":[
-                    {"type":"text","text":prompt},
-                    {"type":"image_url","image_url":{"url":photo_url}}
-                ]}
-            ]
-        )
-        return resp.choices[0].message.content.strip()
+        msg = [
+            {"role":"system","content":"Ты опытный нутрициолог. По фото оцени название блюда, приблизительный состав и КБЖУ."},
+            {"role":"user","content":[
+                {"type":"input_text","text": "Проанализируй фото. Дай название, список ингредиентов и приблизительное КБЖУ." + (f"\nПодсказка: {hint_text}" if hint_text else "")},
+                {"type":"input_image","image_url": image_url}
+            ]}
+        ]
+        out = client.chat.completions.create(model="gpt-4o-mini", messages=msg, temperature=0.2, max_tokens=500)
+        text = out.choices[0].message.content
+        # простейший разбор цифр
+        kcal = re.search(r'(\d{2,4})\s*к?к?ал', text.lower())
+        p = re.search(r'б.*?(\d{1,3})', text.lower())
+        f = re.search(r'ж.*?(\d{1,3})', text.lower())
+        c = re.search(r'у.*?(\d{1,3})', text.lower())
+        title = re.search(r'название\s*[:\-]\s*(.+)', text.lower())
+        return {
+            "kcal": int(kcal.group(1)) if kcal else 500,
+            "p": int(p.group(1)) if p else 30,
+            "f": int(f.group(1)) if f else 20,
+            "c": int(c.group(1)) if c else 50,
+            "title": (title.group(1).strip().title() if title else "Блюдо"),
+            "items": re.findall(r'•\s*(.+)', text)
+        }
     except Exception as e:
-        return f"⚠️ Ошибка анализа фото: {e}"
-
-@bot.message_handler(func=lambda x: x.text==MAIN_BTNS["photo"])
-def kbju_photo_hint(m):
-    bot.send_message(m.chat.id, "Пришли фото блюда одним сообщением. Начну анализ и пришлю КБЖУ.", reply_markup=back_menu())
-
-@bot.message_handler(content_types=['photo'])
-def on_photo(m):
-    # статус
-    s = temp_message(m.chat.id, "🧠 Начинаю анализировать изображение на КБЖУ…")
-    try:
-        send_typing(m.chat.id, "upload_photo", 3)
-        # возьмём самый большой файл
-        file_id = m.photo[-1].file_id
-        fi = bot.get_file(file_id)
-        # публичный URL у Telegram нет, но API отдаёт path -> формируем ссылку CDN
-        # альтернатива: скачать и поднять на filesend — но Render без диска. 
-        # Поэтому используем прямую ссылку Telegram Files:
-        photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fi.file_path}"
-        txt = ai_vision_kbju(photo_url)
-        delete_temp(s)
-        bot.send_message(m.chat.id, txt, reply_markup=main_menu(m.from_user.id))
-    except Exception as e:
-        delete_temp(s)
-        bot.send_message(m.chat.id, f"⚠️ Не удалось обработать фото: {e}", reply_markup=main_menu(m.from_user.id))
-
-# ===== Меню на неделю =====
-GOAL_BTNS = ["🏃 Похудение","⚖️ Поддержание","💪 Набор массы"]
-SEX_BTNS  = ["👨 Мужчина","👩 Женщина"]
-
-def ask_profile(m):
-    kb=ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton(SEX_BTNS[0]), KeyboardButton(SEX_BTNS[1]))
-    bot.send_message(m.chat.id, "Укажи пол:", reply_markup=kb)
-    bot.register_next_step_handler(m, prof_sex)
-
-def prof_sex(m):
-    if m.text not in SEX_BTNS:
-        bot.register_next_step_handler(m, prof_sex); return
-    db=_load(); u=get_user(db, m.from_user.id); u["profile"]["sex"]= "male" if "Мужчина" in m.text else "female"; _save(db)
-    msg = bot.send_message(m.chat.id, "Введи рост в см (например 178):", reply_markup=back_menu())
-    bot.register_next_step_handler(msg, prof_height)
-
-def prof_height(m):
-    if m.text==MAIN_BTNS["back"]:
-        bot.send_message(m.chat.id, "Отменено.", reply_markup=main_menu(m.from_user.id)); return
-    try:
-        h=int(m.text); assert 120<=h<=230
-        db=_load(); u=get_user(db, m.from_user.id); u["profile"]["height"]=h; _save(db)
-        msg = bot.send_message(m.chat.id, "Введи вес в кг (например 74):", reply_markup=back_menu())
-        bot.register_next_step_handler(msg, prof_weight)
-    except:
-        msg = bot.send_message(m.chat.id,"Нужно целое число от 120 до 230. Попробуй ещё:", reply_markup=back_menu())
-        bot.register_next_step_handler(msg, prof_height)
-
-def prof_weight(m):
-    if m.text==MAIN_BTNS["back"]:
-        bot.send_message(m.chat.id, "Отменено.", reply_markup=main_menu(m.from_user.id)); return
-    try:
-        w=float(m.text); assert 30<=w<=300
-        db=_load(); u=get_user(db, m.from_user.id); u["profile"]["weight"]=float(w); _save(db)
-        kb=ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.row(*[KeyboardButton(x) for x in GOAL_BTNS])
-        bot.send_message(m.chat.id, "Выбери цель:", reply_markup=kb)
-        bot.register_next_step_handler(m, prof_goal)
-    except:
-        msg = bot.send_message(m.chat.id,"Нужно число от 30 до 300. Попробуй ещё:", reply_markup=back_menu())
-        bot.register_next_step_handler(msg, prof_weight)
-
-def prof_goal(m):
-    if m.text not in GOAL_BTNS:
-        bot.register_next_step_handler(m, prof_goal); return
-    db=_load(); u=get_user(db, m.from_user.id)
-    goal_map={"🏃 Похудение":"cut","⚖️ Поддержание":"maintain","💪 Набор массы":"bulk"}
-    u["profile"]["goal"]=goal_map[m.text]; _save(db)
-    build_week_menu(m)
-
-def bmr_mifflin(sex, w, h, age=30):
-    # грубо, возраста нет в анкете — по умолчанию 30
-    s = 5 if sex=="male" else -161
-    return 10*w + 6.25*h - 5*age + s
-
-def build_week_menu(m):
-    uid=m.from_user.id
-    if not has_premium(uid):
-        # анкету можно заполнить без премиума -> затем попросим оплату
-        bot.send_message(m.chat.id, "🔒 Эта функция платная. Оформи премиум в меню.", reply_markup=main_menu(uid))
-        return
-    db=_load(); u=get_user(db, uid); p=u.get("profile",{})
-    if not {"sex","height","weight","goal"}<=set(p.keys()):
-        ask_profile(m); return
-    # оценим калории
-    kcal = round(bmr_mifflin(p["sex"], p["weight"], p["height"]) * (1.35 if p["goal"]!="bulk" else 1.55))
-    if p["goal"]=="cut": kcal-=300
-    if p["goal"]=="bulk": kcal+=300
-
-    t=temp_message(m.chat.id, "🗓️ Создаю план под вас!")
-    send_typing(m.chat.id, "typing", 4)
-    prompt = (
-        "Составь подробное меню на 7 дней (Пн..Вс) под параметры:\n"
-        f"Пол: {('мужчина' if p['sex']=='male' else 'женщина')}, Рост: {p['height']} см, Вес: {p['weight']} кг, "
-        f"Цель: {p['goal']}.\n"
-        f"Дневная калорийность ~{kcal} ккал. На каждый день дай 4–5 приёмов пищи, названия блюд и граммовки. "
-        "Пиши строго по дням недели: Пн:, Вт:, Ср:, Чт:, Пт:, Сб:, Вс:. В конце каждого дня — итого ккал и Б/Ж/У."
-    )
-    txt = ai_call(prompt)
-    delete_temp(t)
-    bot.send_message(m.chat.id, f"<b>Твой ориентир:</b> ~{kcal} ккал/день\n\n{txt}", reply_markup=main_menu(uid))
-
-@bot.message_handler(func=lambda x: x.text==MAIN_BTNS["menu"])
-def start_menu_wizard(m):
-    ask_profile(m)
-
-# ===== Админка (callback-based, чтобы всегда работало) =====
-def admin_kb():
-    kb=InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("👥 Пользователи", callback_data="adm_users"),
-           InlineKeyboardButton("💎 Активные премиумы", callback_data="adm_prem"))
-    kb.row(InlineKeyboardButton("📣 Сообщение всем", callback_data="adm_broadcast"),
-           InlineKeyboardButton("✏️ Изм. приветствие", callback_data="adm_welcome"))
-    kb.row(InlineKeyboardButton("💵 Изм. цену (звёзды)", callback_data="adm_price"))
+        return {"kcal": 520, "p": 32, "f": 18, "c": 50, "title":"Блюдо", "items":[f"Ошибка ИИ: {e}"]}
+        # ====== Клавиатуры ======
+def main_menu(uid:int=None):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("📸 КБЖУ по фото"), KeyboardButton("🧾 КБЖУ по списку"))
+    kb.row(KeyboardButton("📅 Меню на неделю"), KeyboardButton("👨‍🍳 Рецепты от ИИ"))
+    kb.row(KeyboardButton("⭐ Купить премиум"), KeyboardButton("📊 Проверить премиум"))
+    if uid and is_admin(uid):
+        kb.row(KeyboardButton("🛠 Админ-панель"))
     return kb
 
-@bot.message_handler(func=lambda x: x.text==MAIN_BTNS["admin"])
-def admin_entry(m):
-    if not is_admin(m.from_user.id):
-        bot.reply_to(m, "⛔ Нет доступа.", reply_markup=main_menu(m.from_user.id)); return
-    bot.send_message(m.chat.id, "🔧 Админ-панель", reply_markup=admin_kb())
+def back_kb():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.row(KeyboardButton("⬅️ Назад"))
+    return kb
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_"))
-def admin_actions(c):
-    if not is_admin(c.from_user.id):
-        bot.answer_callback_query(c.id, "Нет доступа"); return
-    db=_load()
-    if c.data=="adm_users":
-        total=len([k for k in db.keys() if k!="__payments__"])
-        bot.send_message(c.message.chat.id, f"👥 Всего: <b>{total}</b>")
-    elif c.data=="adm_prem":
-        now=int(time.time())
-        active=sum(1 for u in db.values() if isinstance(u,dict) and u.get("premium") and u.get("premium_until",0)>now)
-        bot.send_message(c.message.chat.id, f"💎 Активных премиумов: <b>{active}</b>")
-    elif c.data=="adm_price":
-        bot.send_message(c.message.chat.id, f"Текущая цена: {get_current_price()} ⭐\nОтправь новое число:")
-        bot.register_next_step_handler(c.message, admin_price_step)
-    elif c.data=="adm_broadcast":
-        bot.send_message(c.message.chat.id, "Напиши текст рассылки. Будь краток.")
-        bot.register_next_step_handler(c.message, admin_broadcast_step)
-    elif c.data=="adm_welcome":
-        bot.send_message(c.message.chat.id, "Пришли новый текст приветствия (/start).")
-        bot.register_next_step_handler(c.message, admin_welcome_step)
+def sex_kb():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("Мужчина"), KeyboardButton("Женщина"))
+    kb.row(KeyboardButton("⬅️ Назад"))
+    return kb
 
-def admin_price_step(m):
-    if not is_admin(m.from_user.id): return
-    try:
-        new=int(m.text.strip()); os.environ["STAR_PRICE_PREMIUM"]=str(new)
-        bot.reply_to(m, f"✅ Новая цена: {new} ⭐", reply_markup=main_menu(m.from_user.id))
-    except Exception as e:
-        bot.reply_to(m, f"⚠️ Ошибка: {e}", reply_markup=main_menu(m.from_user.id))
+def goal_kb():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("Похудение"), KeyboardButton("Поддержание веса"), KeyboardButton("Набор массы"))
+    kb.row(KeyboardButton("⬅️ Назад"))
+    return kb
 
-def admin_broadcast_step(m):
-    if not is_admin(m.from_user.id): return
-    txt=m.text.strip()
-    db=_load()
-    sent=0
-    for k,u in db.items():
-        if k=="__payments__": continue
-        try:
-            bot.send_message(int(k), f"📣 {txt}")
-            sent+=1
-            time.sleep(0.05)
-        except: pass
-    bot.reply_to(m, f"✅ Отправлено: {sent}")
+# ====== Пользовательские состояния ======
+USER_FLOW = {}  # {uid: {"step": "...", "tmp": {...}}}
 
-def admin_welcome_step(m):
-    if not is_admin(m.from_user.id): return
-    global WELCOME
-    WELCOME = m.text.strip()
-    bot.reply_to(m, "✅ Приветствие обновлено.")
-    # bot.py (часть 4/4)
+def reset_flow(uid:int):
+    USER_FLOW.pop(uid, None)
 
-# ===== Оплата Stars =====
-@bot.callback_query_handler(func=lambda c: c.data=="buy_stars")
-def buy_stars(c):
+# ====== Старт ======
+@bot.message_handler(commands=["start"])
+def cmd_start(m):
+    db = _load(); u = get_user(db, m.from_user.id); _save(db)
+    bot.send_message(m.chat.id, get_welcome_text(), reply_markup=main_menu(m.from_user.id))
+
+@bot.message_handler(func=lambda m: m.text=="📊 Проверить премиум")
+def check_premium(m):
+    if has_premium(m.from_user.id):
+        db = _load(); u = db.get(str(m.from_user.id), {})
+        exp = u.get("premium_until", 0)
+        exp_str = datetime.datetime.fromtimestamp(exp).strftime("%d.%m.%Y") if exp>0 else "∞"
+        bot.reply_to(m, f"✅ Премиум активен до <b>{exp_str}</b>.", reply_markup=main_menu(m.from_user.id))
+    else:
+        bot.reply_to(m, "❌ Премиум не активен.", reply_markup=main_menu(m.from_user.id))
+
+@bot.message_handler(func=lambda m: m.text=="⭐ Купить премиум")
+def buy_premium(m):
     price = get_current_price()
-    prices = [LabeledPrice(label=f"Премиум {PREMIUM_DAYS} дней", amount=price)]
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(f"Оплатить {price} ⭐", callback_data="buy_premium_stars"))
+    bot.send_message(m.chat.id, f"Премиум на {PREMIUM_DAYS} дней.\nЦена: {price} ⭐", reply_markup=kb)
+
+# ====== Анкета для плана ======
+@bot.message_handler(func=lambda m: m.text=="📅 Меню на неделю")
+def week_menu_start(m):
+    uid = m.from_user.id
+    db = _load(); u = get_user(db, uid)
+    USER_FLOW[uid] = {"step":"ask_sex", "tmp":{}}
+    bot.send_message(m.chat.id, "Кому составляем план? Выберите пол:", reply_markup=sex_kb())
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step")=="ask_sex")
+def week_menu_sex(m):
+    if m.text == "⬅️ Назад":
+        reset_flow(m.from_user.id); bot.send_message(m.chat.id, "Окей, вернул в меню.", reply_markup=main_menu(m.from_user.id)); return
+    if m.text not in ("Мужчина","Женщина"):
+        bot.reply_to(m, "Выберите кнопку «Мужчина» или «Женщина».", reply_markup=sex_kb()); return
+    USER_FLOW[m.from_user.id]["tmp"]["sex"] = "male" if m.text=="Мужчина" else "female"
+    USER_FLOW[m.from_user.id]["step"] = "ask_height"
+    bot.send_message(m.chat.id, "Введите рост (см):", reply_markup=back_kb())
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step")=="ask_height")
+def week_menu_height(m):
+    if m.text == "⬅️ Назад":
+        USER_FLOW[m.from_user.id]["step"]="ask_sex"; bot.send_message(m.chat.id,"Кому план? Пол:", reply_markup=sex_kb()); return
+    try:
+        h = int(re.sub(r"[^\d]", "", m.text))
+        if h < 100 or h > 240: raise ValueError
+        USER_FLOW[m.from_user.id]["tmp"]["height"] = h
+        USER_FLOW[m.from_user.id]["step"] = "ask_weight"
+        bot.send_message(m.chat.id, "Введите вес (кг):", reply_markup=back_kb())
+    except:
+        bot.reply_to(m, "Напишите целое число, например 178.", reply_markup=back_kb())
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step")=="ask_weight")
+def week_menu_weight(m):
+    if m.text == "⬅️ Назад":
+        USER_FLOW[m.from_user.id]["step"]="ask_height"; bot.send_message(m.chat.id,"Введите рост (см):", reply_markup=back_kb()); return
+    try:
+        w = int(re.sub(r"[^\d]", "", m.text))
+        if w < 30 or w > 300: raise ValueError
+        USER_FLOW[m.from_user.id]["tmp"]["weight"] = w
+        USER_FLOW[m.from_user.id]["step"] = "ask_goal"
+        bot.send_message(m.chat.id, "Выберите цель:", reply_markup=goal_kb())
+    except:
+        bot.reply_to(m, "Напишите целое число, например 72.", reply_markup=back_kb())
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step")=="ask_goal")
+def week_menu_goal(m):
+    if m.text == "⬅️ Назад":
+        USER_FLOW[m.from_user.id]["step"]="ask_weight"; bot.send_message(m.chat.id,"Введите вес (кг):", reply_markup=back_kb()); return
+    if m.text not in ("Похудение","Поддержание веса","Набор массы"):
+        bot.reply_to(m, "Выберите кнопку цели.", reply_markup=goal_kb()); return
+    USER_FLOW[m.from_user.id]["tmp"]["goal"] = m.text
+    USER_FLOW[m.from_user.id]["step"] = "build_week_plan"
+
+    # сохраним профиль
+    db = _load(); u = get_user(db, m.from_user.id)
+    u["profile"].update(USER_FLOW[m.from_user.id]["tmp"])
+    db[str(m.from_user.id)] = u; _save(db)
+
+    # запуск генерации
+    bot.send_chat_action(m.chat.id, "typing")
+    msg = bot.send_message(m.chat.id, "🧠 Создаю план под вас! Это может занять 5–10 секунд…", reply_markup=back_kb())
+    plan = build_week_menu_ai(m.from_user.id)
+    bot.edit_message_text(plan, m.chat.id, msg.message_id, reply_markup=main_menu(m.from_user.id))
+    reset_flow(m.from_user.id)
+
+def build_week_menu_ai(uid:int) -> str:
+    db = _load(); u = get_user(db, uid)
+    sex = "мужчина" if u["profile"].get("sex")=="male" else "женщина"
+    h = u["profile"].get("height") or 170
+    w = u["profile"].get("weight") or 70
+    goal = u["profile"].get("goal") or "Поддержание веса"
+
+    prompt = (
+        f"Составь подробный план питания на 7 дней, по дням недели.\n"
+        f"Профиль: пол {sex}, рост {h} см, вес {w} кг, цель: {goal}.\n"
+        f"На каждый день: завтрак/обед/ужин/перекусы, приблизительные граммовки и КБЖУ каждого блюда. "
+        f"Суммарную суточную калорийность выводи строкой «Итого за день: N ккал». "
+        f"Пиши кратко, но структурировано. Без медицинских заявлений."
+    )
+    ans = ai_summarize(prompt, system="Ты нутрициолог. Пиши структурировано, по дням.")
+    return ans
+    # ====== КБЖУ по списку ======
+@bot.message_handler(func=lambda m: m.text=="🧾 КБЖУ по списку")
+def kbju_list_start(m):
+    uid = m.from_user.id
+    start_trial_if_needed(uid)
+    bot.send_message(
+        m.chat.id,
+        "Пробный доступ активен ✅\nПришли список в формате: «Продукт 120 г; ...». Пример:\n"
+        "Кур. грудка 150 г; Рис 180 г; Салат 120 г",
+        reply_markup=back_kb()
+    )
+    USER_FLOW[uid] = {"step":"kbju_list"}
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step")=="kbju_list")
+def kbju_list_calc(m):
+    if m.text == "⬅️ Назад":
+        reset_flow(m.from_user.id); bot.send_message(m.chat.id,"Окей, вернул в меню.", reply_markup=main_menu(m.from_user.id)); return
+    uid = m.from_user.id
+    if not (trial_active(uid) or has_premium(uid)):
+        price = get_current_price()
+        bot.reply_to(m, f"🔒 Функция доступна с премиумом. Купи премиум за {price} ⭐.", reply_markup=main_menu(uid))
+        reset_flow(uid); return
+
+    items = [x.strip() for x in re.split(r"[;,]\s*", m.text) if x.strip()]
+    if not items:
+        bot.reply_to(m, "Не понял список 🤔 Пришли так: «Кур. грудка 150 г; Рис 180 г; Салат 120 г».", reply_markup=back_kb()); return
+
+    # ИИ-подсчёт КБЖУ по списку (семантический)
+    prompt = (
+        "Посчитай КБЖУ для списка продуктов с граммовкой. Верни итог и краткую таблицу.\n" +
+        "\n".join(items)
+    )
+    ans = ai_summarize(prompt, system="Ты нутрициолог. Учитывай типичные пищевые ценности. Пиши кратко.")
+    bot.send_message(m.chat.id, ans, reply_markup=main_menu(uid))
+    reset_flow(uid)
+
+# ====== КБЖУ по фото ======
+@bot.message_handler(func=lambda m: m.text=="📸 КБЖУ по фото")
+def kbju_photo_hint(m):
+    uid = m.from_user.id
+    start_trial_if_needed(uid)
+    USER_FLOW[uid] = {"step":"wait_photo_hint"}
+    bot.send_message(m.chat.id, "Пришли фото блюда. Можно добавить подпись с ингредиентами.", reply_markup=back_kb())
+
+@bot.message_handler(content_types=['photo'])
+def kbju_photo_handle(m):
+    uid = m.from_user.id
+    state = USER_FLOW.get(uid,{}).get("step")
+    if state not in ("wait_photo_hint", None):  # разбираем только в этой ветке
+        return
+    if not (trial_active(uid) or has_premium(uid)):
+        price = get_current_price()
+        bot.reply_to(m, f"🔒 Для лучшего распознавания нужен премиум. Купи за {price} ⭐.", reply_markup=main_menu(uid))
+        reset_flow(uid); return
+
+    # URL фото
+    file_id = m.photo[-1].file_id
+    info = bot.get_file(file_id)
+    img_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info.file_path}"
+
+    tmp_msg = bot.send_message(m.chat.id, "🧠 Начинаю анализировать изображение на КБЖУ…")
+    result = ai_vision_estimate_kbju(img_url, hint_text=m.caption or "")
+    title = result.get("title","Блюдо")
+    items = result.get("items", [])
+    ans = (
+        f"<b>{title}</b>\n"
+        + (("Ингредиенты: " + ", ".join(items) + "\n") if items else "")
+        + f"Примерно: ~{result['kcal']} ккал, Б/Ж/У {result['p']}/{result['f']}/{result['c']}"
+    )
+    bot.edit_message_text(ans, m.chat.id, tmp_msg.message_id, reply_markup=main_menu(uid))
+    reset_flow(uid)
+
+# ====== Рецепты от ИИ ======
+@bot.message_handler(func=lambda m: m.text=="👨‍🍳 Рецепты от ИИ")
+def recipes_menu(m):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("Рецепт по калориям"), KeyboardButton("Рецепт по запросу"))
+    kb.row(KeyboardButton("⬅️ Назад"))
+    bot.send_message(m.chat.id, "Выбери режим:", reply_markup=kb)
+    USER_FLOW[m.from_user.id] = {"step":"recipes_menu"}
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step")=="recipes_menu")
+def recipes_choice(m):
+    if m.text == "⬅️ Назад":
+        reset_flow(m.from_user.id); bot.send_message(m.chat.id, "Окей, меню.", reply_markup=main_menu(m.from_user.id)); return
+    if m.text == "Рецепт по калориям":
+        USER_FLOW[m.from_user.id] = {"step":"recipe_cal"}
+        bot.send_message(m.chat.id, "Сколько ккал нужно? Например: 600", reply_markup=back_kb())
+    elif m.text == "Рецепт по запросу":
+        USER_FLOW[m.from_user.id] = {"step":"recipe_free"}
+        bot.send_message(m.chat.id, "Что приготовить? Например: блины без сахара", reply_markup=back_kb())
+    else:
+        bot.reply_to(m, "Выбери режим рецептов.", reply_markup=back_kb())
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step")=="recipe_cal")
+def recipe_by_cal(m):
+    if m.text=="⬅️ Назад":
+        recipes_menu(m); return
+    try:
+        cal = int(re.sub(r"[^\d]","", m.text))
+        tmp = bot.send_message(m.chat.id, "👨‍🍳 Создаю рецепт…")
+        prompt = (
+            f"Придумай простой рецепт примерно на {cal} ккал. "
+            "Дай список ингредиентов с граммовкой, шаги приготовления и оценку КБЖУ."
+        )
+        ans = ai_summarize(prompt, system="Ты кулинар и нутрициолог. Пиши структурировано.")
+        bot.edit_message_text(ans, m.chat.id, tmp.message_id, reply_markup=main_menu(m.from_user.id))
+        reset_flow(m.from_user.id)
+    except:
+        bot.reply_to(m, "Напиши число, например 600.", reply_markup=back_kb())
+
+@bot.message_handler(func=lambda m: USER_FLOW.get(m.from_user.id,{}).get("step")=="recipe_free")
+def recipe_free(m):
+    if m.text=="⬅️ Назад":
+        recipes_menu(m); return
+    tmp = bot.send_message(m.chat.id, "👨‍🍳 Создаю рецепт…")
+    prompt = (
+        f"Сгенерируй рецепт по запросу: «{m.text}». "
+        "Дай ингредиенты с граммовкой, шаги, время приготовления и КБЖУ на порцию."
+    )
+    ans = ai_summarize(prompt, system="Ты кулинар и нутрициолог. Пиши структурировано.")
+    bot.edit_message_text(ans, m.chat.id, tmp.message_id, reply_markup=main_menu(m.from_user.id))
+    reset_flow(m.from_user.id)
+    # ====== Оплата Stars ======
+@bot.callback_query_handler(func=lambda c: c.data=="buy_premium_stars")
+def cb_buy_premium_stars(c):
+    price_now = get_current_price()
+    prices = [LabeledPrice(label="Премиум на 30 дней", amount=price_now)]
     bot.send_invoice(
         chat_id=c.message.chat.id,
         title="Премиум-доступ",
-        description=f"Все функции на {PREMIUM_DAYS} дней.",
+        description=f"Доступ ко всем функциям на {PREMIUM_DAYS} дней.",
         invoice_payload=f"premium_stars:{c.from_user.id}",
-        provider_token="",            # Stars не требуют токена
+        provider_token="",  # Stars
         currency="XTR",
         prices=prices,
         is_flexible=False
@@ -540,83 +483,127 @@ def pre_checkout(q):
 @bot.message_handler(content_types=['successful_payment'])
 def on_paid(m):
     try:
-        sp=m.successful_payment
+        sp = m.successful_payment
         payload = sp.invoice_payload or ""
         total = getattr(sp, "total_amount", None)
         if payload.startswith("premium_stars:"):
             set_premium(m.from_user.id, PREMIUM_DAYS)
             if total: log_payment(m.from_user.id, total, payload)
-            u=_load().get(str(m.from_user.id),{})
-            exp=datetime.datetime.fromtimestamp(u.get("premium_until",0)).strftime("%d.%m.%Y")
-            bot.send_message(m.chat.id, f"✅ Оплата получена! Премиум активен до <b>{exp}</b>.", reply_markup=main_menu(m.from_user.id))
+            db = _load(); u = db.get(str(m.from_user.id), {})
+            exp = datetime.datetime.fromtimestamp(u.get("premium_until", 0)).strftime("%d.%m.%Y")
+            bot.send_message(m.from_user.id, f"✅ Оплата получена! Премиум активен до <b>{exp}</b>.", reply_markup=main_menu(m.from_user.id))
         else:
             if total: log_payment(m.from_user.id, total, payload)
-            bot.send_message(m.chat.id, "✅ Оплата получена.", reply_markup=main_menu(m.from_user.id))
+            bot.send_message(m.from_user.id, "✅ Оплата получена.", reply_markup=main_menu(m.from_user.id))
     except Exception as e:
         bot.send_message(m.chat.id, f"⚠️ Ошибка обработки платежа: {e}", reply_markup=main_menu(m.from_user.id))
 
-# ===== Мини-веб для Render (и аптайма) =====
+# ====== Админка ======
+@bot.message_handler(func=lambda m: m.text in ("🛠 Админ-панель", "/admin"))
+def admin_panel(m):
+    if not is_admin(m.from_user.id):
+        bot.reply_to(m, "⛔ Нет доступа.", reply_markup=main_menu(m.from_user.id)); return
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("👥 Пользователи", callback_data="adm_users"),
+        InlineKeyboardButton("💎 Активные премиумы", callback_data="adm_premiums")
+    )
+    kb.row(
+        InlineKeyboardButton("📣 Рассылка", callback_data="adm_broadcast"),
+        InlineKeyboardButton("📝 Изм. приветствие", callback_data="adm_welcome")
+    )
+    kb.row(InlineKeyboardButton("💰 Доход (лог)", callback_data="adm_income"))
+    bot.send_message(m.chat.id, "🔧 Админ-панель", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_"))
+def admin_actions(c):
+    if not is_admin(c.from_user.id):
+        bot.answer_callback_query(c.id, "⛔ Нет доступа."); return
+    db = _load()
+    if c.data == "adm_users":
+        bot.send_message(c.message.chat.id, f"👥 Всего пользователей: <b>{len([k for k in db.keys() if k!='__payments__'])}</b>")
+    elif c.data == "adm_premiums":
+        now = int(time.time())
+        active = 0
+        for k,v in db.items():
+            if k=="__payments__": continue
+            if isinstance(v, dict) and (is_admin(int(k)) or (v.get('premium') and v.get('premium_until',0)>now)):
+                active+=1
+        bot.send_message(c.message.chat.id, f"💎 Активных премиумов: <b>{active}</b>")
+    elif c.data == "adm_income":
+        pays = db.get("__payments__", [])
+        total = sum(p["stars"] for p in pays)
+        cnt = len(pays)
+        bot.send_message(c.message.chat.id, f"💰 Локально зафиксировано: <b>{total} ⭐</b> ({cnt} оплат)")
+    elif c.data == "adm_broadcast":
+        bot.send_message(c.message.chat.id, "Отправь текст рассылки (разошлю всем).", parse_mode=None)
+        bot.register_next_step_handler(c.message, admin_broadcast_step)
+    elif c.data == "adm_welcome":
+        bot.send_message(c.message.chat.id, "Пришли новый текст приветствия. Текущий:\n\n" + get_welcome_text(), parse_mode=None)
+        bot.register_next_step_handler(c.message, admin_welcome_step)
+
+def admin_broadcast_step(m):
+    if not is_admin(m.from_user.id): return
+    db = _load()
+    text = m.text
+    ok, fail = 0, 0
+    for k in list(db.keys()):
+        if k=="__payments__": continue
+        try:
+            bot.send_message(int(k), text)
+            ok += 1
+        except:
+            fail += 1
+    bot.reply_to(m, f"📣 Отправлено: {ok}, ошибок: {fail}", reply_markup=main_menu(m.from_user.id))
+
+def admin_welcome_step(m):
+    if not is_admin(m.from_user.id): return
+    set_welcome_text(m.text)
+    bot.reply_to(m, "✅ Приветствие обновлено.", reply_markup=main_menu(m.from_user.id))
+    # ====== Webhook server (Flask) ======
 def run_web():
     try:
-        from flask import Flask
-        WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
+        from flask import Flask, request, abort
         app = Flask(__name__)
-        @app.route("/")
-        def index(): return "Bot is running"
+
+        @app.get("/")
+        def index(): return "Bot is running", 200
+
+        @app.post(f"/tg/{WEBHOOK_SECRET}")
+        def webhook():
+            if request.headers.get('content-type') != 'application/json':
+                return abort(403)
+            # (опционально) проверка кастомного хедера:
+            # if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET: abort(403)
+            update = telebot.types.Update.de_json(request.get_data(as_text=True))
+            bot.process_new_updates([update])
+            return "ok", 200
+
+        # Снимем старый вебхук и поставим новый
+        try:
+            bot.remove_webhook()  # без drop_pending_updates (в старых версиях нет аргумента)
+        except Exception as e:
+            print("remove_webhook warn:", e)
+
+        if not EXTERNAL_HOST:
+            print("⚠️ RENDER_EXTERNAL_HOSTNAME не задан — вебхук не будет установлен.")
+        else:
+            url = f"https://{EXTERNAL_HOST}/tg/{WEBHOOK_SECRET}"
+            bot.set_webhook(url=url)  # можно добавить secret_token=WEBHOOK_SECRET в новых версиях API
+
         port = int(os.getenv("PORT", "10000"))
         app.run(host="0.0.0.0", port=port)
     except Exception as e:
-        print("web warn:", e)
+        print("❌ Webhook setup failed:", e)
 
-# ===== Автоперезапуск раз в сутки =====
+# ====== Авто-перезапуск раз в сутки (подстраховка) ======
 def auto_restart():
     while True:
         time.sleep(24*3600)
         os._exit(0)
 
-# ===== Запуск =====
+# ====== Run ======
 if __name__ == "__main__":
-    # админам — премиум навсегда (на всякий случай при первом старте)
-    for aid in list(ADMIN_IDS):
-        try: set_premium(aid, 3650)
-        except: pass
-
-    # ========= Вебхук-запуск для Render =========
-try:
-    from flask import Flask, request, abort
-    import os
-
-    app = Flask(__name__)
-
-    @app.route('/')
-    def index():
-        return "✅ Bot is alive!", 200
-
-    @app.route(f'/tg/{WEBHOOK_SECRET}', methods=['POST'])
-    def webhook():
-        if request.headers.get('content-type') != 'application/json':
-            abort(403)
-        # проверим секрет (по желанию, можно убрать)
-        if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
-            abort(403)
-        update = telebot.types.Update.de_json(request.get_data(as_text=True))
-        bot.process_new_updates([update])
-        return 'ok', 200
-
-    # Снять старый вебхук и поставить новый
-    bot.remove_webhook()
-    bot.set_webhook(
-        url=f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/tg/{WEBHOOK_SECRET}",
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True,
-        max_connections=40
-    )
-
-    print("✅ Webhook set successfully!")
-
-    # Запускаем Flask
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-except Exception as e:
-    print("❌ Webhook setup failed:", e)
+    threading.Thread(target=auto_restart, daemon=True).start()
+    print("✅ Bot started (webhook)")
+    run_web()
