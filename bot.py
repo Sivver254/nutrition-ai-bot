@@ -580,21 +580,42 @@ if __name__ == "__main__":
         try: set_premium(aid, 3650)
         except: pass
 
-    # снимаем вебхук, поднимаем мини-веб и polling
-    try:
-        bot.remove_webhook(drop_pending_updates=True)
-    except Exception as e:
-        print("remove_webhook warn:", e)
+    # ========= Вебхук-запуск для Render =========
+try:
+    from flask import Flask, request, abort
+    import os
 
-    threading.Thread(target=run_web, daemon=True).start()
-    threading.Thread(target=auto_restart, daemon=True).start()
+    app = Flask(__name__)
 
-    print("✅ Bot started")
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=90, long_polling_timeout=30)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print("polling error:", e)
-            time.sleep(3)
+    @app.route('/')
+    def index():
+        return "✅ Bot is alive!", 200
+
+    @app.route(f'/tg/{WEBHOOK_SECRET}', methods=['POST'])
+    def webhook():
+        if request.headers.get('content-type') != 'application/json':
+            abort(403)
+        # проверим секрет (по желанию, можно убрать)
+        if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
+            abort(403)
+        update = telebot.types.Update.de_json(request.get_data(as_text=True))
+        bot.process_new_updates([update])
+        return 'ok', 200
+
+    # Снять старый вебхук и поставить новый
+    bot.remove_webhook()
+    bot.set_webhook(
+        url=f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/tg/{WEBHOOK_SECRET}",
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        max_connections=40
+    )
+
+    print("✅ Webhook set successfully!")
+
+    # Запускаем Flask
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+except Exception as e:
+    print("❌ Webhook setup failed:", e)
