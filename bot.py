@@ -99,7 +99,7 @@ def get_current_price() -> int:
 def main_menu(user_id:int=None):
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(KeyboardButton("⭐ Купить премиум"), KeyboardButton("📊 Проверить премиум"))
-    kb.row(KeyboardButton("📅 Меню на неделю (премиум)"))
+    kb.row(KeyboardButton("📅 Меню на неделю (премиум)")
     if user_id and is_admin(user_id):
         kb.row(KeyboardButton("👨‍💻 Админка"))
     return kb
