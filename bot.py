@@ -962,7 +962,6 @@ if __name__ == "__main__":
     threading.Thread(target=auto_restart, daemon=True).start()
 
     print("✅ Bot started")
-    while True:
     try:
         if __name__ == "__main__":
     # Снять вебхук на всякий случай, чтобы polling не конфликтовал
